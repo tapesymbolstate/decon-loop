@@ -23,28 +23,27 @@ The end goal is a complete, readable, buildable codebase — not just analysis a
 
 All binaries to analyze are in `target-binaries/`. The loop script passes the specific target file via the prompt.
 
-## Two-Phase Workflow
+## Multi-Cycle Workflow
 
-### Phase 1: Plan (auto-generates prd.json)
-When `prd.json` does not exist, the agent runs in plan mode:
-1. Inspect the target binary (file type, headers, symbols, strings sample)
-2. Identify the binary's nature (runtime, library, app, etc.)
-3. Generate `prd.json` with prioritized analysis tasks
-4. Generate `progress.txt` with initial reconnaissance findings
-5. Output `<promise>PLAN_COMPLETE</promise>` when done
+The loop repeats **Plan → Build → Verify** until source compiles:
 
-### Phase 2: Build (executes prd.json tasks)
-When `prd.json` exists, the agent runs in build mode:
-1. Read `prd.json` → identify incomplete tasks
-2. Read `progress.txt` → review findings from previous iterations
-3. Select the highest-priority incomplete task
-4. Execute the task using binary analysis tools
-5. Save results to the appropriate subdirectory under `output/`
-6. If deobfuscation was needed, save both raw and cleaned versions
-7. Attempt to compile reconstructed source; log result
-8. Update `prd.json` (set passes: true only if output compiles or task doesn't produce source)
-9. Append findings, patterns, and caveats to `progress.txt`
-10. If ALL tasks are complete, output `<promise>COMPLETE</promise>`
+### Phase 1: Plan
+- Cycle 1: Inspect binary, generate initial PRD (recon → analysis → reconstruction)
+- Cycle 2+: Read build errors from verify phase, generate deeper PRD targeting compilation gaps
+
+### Phase 2: Build
+- Iterate through PRD tasks one at a time
+- Each task must produce or improve source files in `output/src/`
+- Attempt compilation after each source change
+- When all PRD tasks pass → `<promise>CYCLE_DONE</promise>`
+
+### Phase 3: Verify
+- Attempt full compilation of `output/src/`
+- If compilation succeeds → **mission complete**
+- If compilation fails → archive current PRD, feed errors to re-plan, start next cycle
+
+### Completion criteria
+Source code in `output/src/` compiles with `clang++`/`swiftc` targeting the original architecture. Not "all PRD tasks done" — **actual compilation success.**
 
 ## Analysis Tools
 
