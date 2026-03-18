@@ -69,11 +69,16 @@ Binary file: \`$BINARY_PATH\`
    - \`nm $BINARY_PATH 2>&1 | head -50\` / \`nm $BINARY_PATH 2>&1 | wc -l\`
    - \`strings $BINARY_PATH | wc -l\` / \`strings $BINARY_PATH | head -200\`
 
-2. Determine: binary type, architecture, languages, embedded frameworks, stripping level, complexity.
+2. Check if Ghidra pre-analysis exists:
+   - \`output/ghidra/function_boundaries.tsv\` — all detected functions with addresses and sizes
+   - \`output/ghidra/call_graph.tsv\` — caller→callee relationships
+   If these exist, use them to inform task planning (you have real function boundaries, not just guesses).
 
-3. Create: \`mkdir -p output/{headers,symbols,strings,classes,protocols,functions,diff,reports,obfuscation,src,records}\`
+3. Determine: binary type, architecture, languages, embedded frameworks, stripping level, complexity, function count from Ghidra.
 
-4. Generate \`output/prd.json\` with schema:
+4. Create: \`mkdir -p output/{headers,symbols,strings,classes,protocols,functions,diff,reports,obfuscation,src,records}\`
+
+5. Generate \`output/prd.json\` with schema:
    \`\`\`json
    { "binaryTarget": "$BINARY_PATH", "binaryType": "DESC", "cycle": 1,
      "userStories": [{ "id": "US-001", "title": "...", "description": "...",
@@ -81,9 +86,9 @@ Binary file: \`$BINARY_PATH\`
    \`\`\`
    Rules: start structural → symbols → deps → strings → components → disassembly → source reconstruction. 5-15 tasks. Each completable in one iteration.
 
-5. Generate \`output/progress.txt\` with recon under \`## Codebase Patterns\` and empty \`## Iteration Log\`.
+6. Generate \`output/progress.txt\` with recon under \`## Codebase Patterns\` and empty \`## Iteration Log\`.
 
-6. Save recon to \`output/reports/recon_summary.md\`.
+7. Save recon to \`output/reports/recon_summary.md\`.
 
 ## Rules
 - NEVER modify the target binary. All output goes inside \`output/\`.
@@ -109,6 +114,8 @@ Binary file: \`$BINARY_PATH\`
 - Read \`output/prd.json\` to see what was already done (all passes: true)
 - Existing source skeletons are in \`output/src/\`
 - Previous reports are in \`output/reports/\`
+- Ghidra data (if available): \`output/ghidra/function_boundaries.tsv\`, \`output/ghidra/call_graph.tsv\`, \`output/ghidra/all_decompiled.c\`
+- To get individual function decompilation, check \`output/ghidra/functions/\` or run \`./ghidra_analyze.sh $BINARY_PATH full\`
 
 ## Build errors from last verification
 \`\`\`
@@ -155,6 +162,12 @@ Binary file: \`$BINARY_PATH\`
 3. Execute ONLY that one task. Tools available:
    - \`otool\`, \`nm\`, \`strings\`, \`xxd\`, \`hexdump\`, \`objdump\`, \`c++filt\`, \`swift demangle\`
    - \`clang\`, \`clang++\`, \`swiftc\` (for compilation verification)
+   - Ghidra pre-analysis data (if available):
+     - \`output/ghidra/function_boundaries.tsv\` — all functions with name, address, size, params, return type
+     - \`output/ghidra/call_graph.tsv\` — caller→callee call graph
+     - \`output/ghidra/all_decompiled.c\` — full decompiled C pseudocode (if full mode was run)
+     - \`output/ghidra/functions/\` — individual function decompilations
+   - To run full Ghidra decompilation: \`./ghidra_analyze.sh $BINARY_PATH full\`
 4. Save analysis to \`output/{headers,symbols,strings,reports,functions}/\`
 5. Save/update reconstructed source in \`output/src/\`
 6. After writing source, attempt compilation:
@@ -233,6 +246,32 @@ verify_build() {
         return 1
     fi
 }
+
+# ─── Phase 0: Ghidra pre-analysis (run once) ────────────────────────────────
+
+if [ ! -f "output/ghidra/function_boundaries.tsv" ]; then
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║  GHIDRA PRE-ANALYSIS                                       ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "Running Ghidra headless analysis (function boundaries + call graph)..."
+    echo "This may take 10-30 minutes for large binaries."
+    echo ""
+
+    ./ghidra_analyze.sh "$BINARY_PATH" quick 2>&1 | tee -a "$RECORD_FILE"
+
+    if [ -f "output/ghidra/function_boundaries.tsv" ]; then
+        FUNC_COUNT=$(tail -n +2 output/ghidra/function_boundaries.tsv | wc -l | tr -d ' ')
+        echo ""
+        echo "Ghidra found $FUNC_COUNT functions. Proceeding to plan phase."
+        echo ""
+    else
+        echo ""
+        echo "Warning: Ghidra analysis did not produce function_boundaries.tsv."
+        echo "Continuing without Ghidra data (reduced quality)."
+        echo ""
+    fi
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN LOOP: Plan → Build → Verify → Re-plan if needed
