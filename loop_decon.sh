@@ -249,29 +249,48 @@ verify_build() {
 
 # ─── Phase 0: Ghidra pre-analysis (run once) ────────────────────────────────
 
-if [ ! -f "output/ghidra/function_boundaries.tsv" ]; then
-    echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║  GHIDRA PRE-ANALYSIS                                       ║"
-    echo "╚══════════════════════════════════════════════════════════════╝"
-    echo ""
-    echo "Running Ghidra headless analysis (function boundaries + call graph)..."
-    echo "This may take 10-30 minutes for large binaries."
-    echo ""
+mkdir -p /tmp/ghidra-projects output/ghidra
 
+echo "╔══════════════════════════════════════════════════════════════╗"
+echo "║  GHIDRA PRE-ANALYSIS                                       ║"
+echo "╚══════════════════════════════════════════════════════════════╝"
+echo ""
+
+# Step 1: Quick analysis (function boundaries + call graph)
+if [ ! -f "output/ghidra/function_boundaries.tsv" ]; then
+    echo "[1/2] Running quick analysis (function boundaries + call graph)..."
     ./ghidra_analyze.sh "$BINARY_PATH" quick 2>&1 | tee -a "$RECORD_FILE"
 
     if [ -f "output/ghidra/function_boundaries.tsv" ]; then
         FUNC_COUNT=$(tail -n +2 output/ghidra/function_boundaries.tsv | wc -l | tr -d ' ')
-        echo ""
-        echo "Ghidra found $FUNC_COUNT functions. Proceeding to plan phase."
-        echo ""
+        echo "Quick done: $FUNC_COUNT functions found."
     else
-        echo ""
-        echo "Warning: Ghidra analysis did not produce function_boundaries.tsv."
-        echo "Continuing without Ghidra data (reduced quality)."
-        echo ""
+        echo "Warning: Quick analysis failed. Continuing without Ghidra data."
     fi
+else
+    FUNC_COUNT=$(tail -n +2 output/ghidra/function_boundaries.tsv | wc -l | tr -d ' ')
+    echo "[1/2] Quick analysis cached ($FUNC_COUNT functions). Skipping."
 fi
+
+# Step 2: Full decompilation (all functions → C pseudocode)
+if [ ! -f "output/ghidra/all_decompiled.c" ]; then
+    echo ""
+    echo "[2/2] Running full decompilation (this takes 30-60 min for large binaries)..."
+    ./ghidra_analyze.sh "$BINARY_PATH" full 2>&1 | tee -a "$RECORD_FILE"
+
+    if [ -f "output/ghidra/all_decompiled.c" ]; then
+        DECOMP_SIZE=$(du -sh output/ghidra/all_decompiled.c | cut -f1)
+        DECOMP_FUNCS=$(grep -c '^// ===' output/ghidra/all_decompiled.c 2>/dev/null || echo "?")
+        echo "Full decompilation done: $DECOMP_FUNCS functions, $DECOMP_SIZE."
+    else
+        echo "Warning: Full decompilation failed. Continuing with quick data only."
+    fi
+else
+    DECOMP_SIZE=$(du -sh output/ghidra/all_decompiled.c | cut -f1)
+    echo "[2/2] Full decompilation cached ($DECOMP_SIZE). Skipping."
+fi
+
+echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN LOOP: Plan → Build → Verify → Re-plan if needed

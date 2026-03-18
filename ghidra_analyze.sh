@@ -33,6 +33,8 @@ fi
 BINARY_NAME=$(basename "$BINARY_PATH")
 PROJECT_NAME="decon_${BINARY_NAME}"
 
+# Clean stale locks from previous runs, then ensure dirs exist
+rm -rf "${PROJECT_DIR:?}/${PROJECT_NAME}" "${PROJECT_DIR:?}/${PROJECT_NAME}.rep" "${PROJECT_DIR:?}/${PROJECT_NAME}.lock" 2>/dev/null
 mkdir -p "$PROJECT_DIR" "$OUTPUT_DIR"
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
