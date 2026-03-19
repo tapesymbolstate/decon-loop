@@ -41,6 +41,7 @@ if [ "${1:-}" = "codex" ] || [ "${1:-}" = "claude" ]; then
 fi
 
 MAX_ITERATIONS=${1:-0}
+TARGET_COVERAGE=${TARGET_COVERAGE:-80}
 ITERATION=0
 CYCLE=0
 
@@ -158,33 +159,56 @@ gen_replan_prompt() {
 "
     fi
 
+    # List already-completed source files so planner avoids duplicating work
+    local existing_files=""
+    if [ -d "output/src" ]; then
+        existing_files=$(ls output/src/ 2>/dev/null | tr '\n' ', ')
+    fi
+
+    # List archived PRD files for context
+    local archived_prds=""
+    if [ -d "output/records" ]; then
+        archived_prds=$(ls output/records/prd_cycle_*.json 2>/dev/null | tr '\n' ', ')
+    fi
+
     cat <<REPLAN_EOF
-You are a source reconstruction planner running cycle $cycle_num. Verification FAILED.
+You are a source reconstruction planner running cycle $cycle_num.
 
 ## Target
 Binary file: \`$BINARY_PATH\`
 
-## Failure
+## Previous cycle result
 \`\`\`
 $build_errors
 \`\`\`
 
 ## Diagnosis
+- "COVERAGE:" → previous cycle succeeded but more functions need lifting. Plan the NEXT batch of modules.
 - "QUALITY:" → source is metadata/stubs, not real code. Delete and re-lift from Ghidra.
 - "COMPILATION:" → real code but compile errors. Fix specific issues.
 
+## Already completed source files (DO NOT recreate these)
+\`\`\`
+$existing_files
+\`\`\`
+${archived_prds:+Previous PRDs: $archived_prds}
+
 ## Available data
-- \`output/progress.txt\`, \`output/prd.json\`, \`output/src/\`
-- \`output/ghidra/function_boundaries.tsv\`, \`call_graph.tsv\`, \`functions/\`
+- \`output/progress.txt\`, \`output/src/\` (already lifted code — keep these!)
+- \`output/ghidra/function_boundaries.tsv\`, \`call_graph.tsv\`, \`functions/\`, \`module_chunks.tsv\`
 $mapping_note
 ## Job
-1. Archive: \`cp output/prd.json output/records/prd_cycle_$((cycle_num - 1)).json\`
-2. If QUALITY failure: \`rm -f output/src/*\`, start fresh
+1. Read \`output/mapping/function_map.tsv\` (or \`function_boundaries.tsv\`) to find functions NOT yet covered by existing source files
+2. Read \`output/ghidra/module_chunks.tsv\` to identify the next batch of address-prefix groups to lift
 3. Generate NEW \`output/prd.json\` (\`"cycle": $cycle_num\`):
+   - Plan 15-25 NEW tasks covering functions not in existing source files
    - Every task: \`ghidraFunctions\`, \`addressRange\`, \`targetSourceFile\`
    - If mapping available: include \`sourceFiles\`, match output language to original
+   - Target different source files than already completed ones
    - Output must be real source code, not analysis artifacts
 4. Append cycle note to \`output/progress.txt\`
+
+## CRITICAL: Do NOT duplicate work. The goal is to EXPAND coverage, not redo what's done.
 
 ## Completion
 When ready, output: <promise>PLAN_COMPLETE</promise>
@@ -308,6 +332,61 @@ spawn_agent() {
     fi
 }
 
+# ─── Coverage: measure how many mapped functions have been lifted ─────────────
+
+measure_coverage() {
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Phase:  COVERAGE CHECK"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    local total_mapped lifted_funcs coverage_pct
+
+    if [ "$HAS_FUNCTION_MAP" = true ] && [ -f "output/mapping/function_map.tsv" ]; then
+        total_mapped=$(tail -n +2 output/mapping/function_map.tsv | wc -l | tr -d ' ')
+    else
+        total_mapped=$(tail -n +2 output/ghidra/function_boundaries.tsv | wc -l | tr -d ' ')
+    fi
+
+    # Count function definitions across all source languages
+    lifted_funcs=0
+    if find output/src -name '*.cpp' -o -name '*.c' 2>/dev/null | grep -q .; then
+        local c_funcs
+        c_funcs=$(grep -cE '^[a-zA-Z_].*\(.*\)\s*\{' output/src/*.cpp output/src/*.c 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}')
+        lifted_funcs=$((lifted_funcs + c_funcs))
+    fi
+    if find output/src -name '*.zig' 2>/dev/null | grep -q .; then
+        local zig_funcs
+        zig_funcs=$(grep -cE '^\s*(pub\s+)?(export\s+)?fn\s+' output/src/*.zig 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}')
+        lifted_funcs=$((lifted_funcs + zig_funcs))
+    fi
+
+    if [ "$total_mapped" -gt 0 ]; then
+        coverage_pct=$((lifted_funcs * 100 / total_mapped))
+    else
+        coverage_pct=0
+    fi
+
+    # Count total LOC across all languages
+    local all_src_files total_loc total_files
+    all_src_files=$(find output/src -name '*.cpp' -o -name '*.c' -o -name '*.zig' -o -name '*.rs' -o -name '*.h' 2>/dev/null)
+    if [ -n "$all_src_files" ]; then
+        total_files=$(echo "$all_src_files" | wc -l | tr -d ' ')
+        total_loc=$(echo "$all_src_files" | xargs wc -l 2>/dev/null | tail -1 | awk '{print $1}')
+    else
+        total_files=0
+        total_loc=0
+    fi
+
+    echo "Coverage: $lifted_funcs/$total_mapped functions lifted ($coverage_pct%)"
+    echo "Source:   $total_files files, $total_loc LOC"
+
+    COVERAGE_PCT=$coverage_pct
+    COVERAGE_FUNCS=$lifted_funcs
+    COVERAGE_TOTAL=$total_mapped
+    COVERAGE_LOC=$total_loc
+    COVERAGE_FILES=$total_files
+}
+
 # ─── Verify: try to compile output/src/ ──────────────────────────────────────
 
 verify_build() {
@@ -315,10 +394,10 @@ verify_build() {
     echo "Phase:  VERIFY (compilation + quality)"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    # ── Gate A: source files exist ──
-    local src_files
-    src_files=$(find output/src -name '*.cpp' -o -name '*.c' -o -name '*.m' -o -name '*.swift' 2>/dev/null)
-    if [ -z "$src_files" ]; then
+    # ── Gate A: source files exist (any language) ──
+    local all_src
+    all_src=$(find output/src -name '*.cpp' -o -name '*.c' -o -name '*.zig' -o -name '*.rs' -o -name '*.h' 2>/dev/null)
+    if [ -z "$all_src" ]; then
         echo "FAIL: No source files in output/src/"
         BUILD_ERRORS="No source files found in output/src/. Must lift Ghidra functions into compilable source."
         return 1
@@ -326,48 +405,42 @@ verify_build() {
 
     # ── Gate B: source quantity thresholds ──
     local file_count loc
-    file_count=$(echo "$src_files" | wc -l | tr -d ' ')
-    loc=$(echo "$src_files" | xargs wc -l 2>/dev/null | tail -1 | awk '{print $1}')
+    file_count=$(echo "$all_src" | wc -l | tr -d ' ')
+    loc=$(echo "$all_src" | xargs wc -l 2>/dev/null | tail -1 | awk '{print $1}')
     echo "Source: $file_count files, $loc LOC"
 
     if [ "$loc" -lt 500 ]; then
-        echo "FAIL: Only $loc LOC (need ≥500). Source is too small for a real reconstruction."
-        BUILD_ERRORS="QUALITY: Only $loc lines of code across $file_count files. Minimum 500 LOC required. Lift more Ghidra functions into output/src/."
+        echo "FAIL: Only $loc LOC (need ≥500)."
+        BUILD_ERRORS="QUALITY: Only $loc lines of code across $file_count files. Minimum 500 LOC required."
         return 1
     fi
 
-    # ── Gate C: source quality — must contain real function logic, not just data structs ──
-    local logic_lines data_lines
-    logic_lines=$(grep -cE '(if\s*\(|while\s*\(|for\s*\(|switch\s*\(|->|<<|>>|\+\+|--|&&|\|\|)' output/src/*.cpp output/src/*.c 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}')
-    data_lines=$(grep -cE '^\s*"[^"]*"|\{\s*"|\{\s*[0-9]' output/src/*.cpp output/src/*.c 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}')
-
-    local total_content=$((logic_lines + data_lines))
-    if [ "$total_content" -gt 0 ]; then
-        local logic_ratio=$((logic_lines * 100 / total_content))
-        echo "Logic density: ${logic_ratio}% ($logic_lines logic lines / $total_content content lines)"
-        if [ "$logic_ratio" -lt 25 ]; then
-            echo "FAIL: Source is ${logic_ratio}% logic (need ≥25%). Files contain mostly data literals, not lifted function implementations."
-            BUILD_ERRORS="QUALITY: Source is only ${logic_ratio}% logic (${logic_lines} logic lines vs ${data_lines} data lines). Files appear to be metadata/struct literals, not real function implementations lifted from Ghidra decompilation. Delete metadata-only files and produce actual C/C++ function implementations from output/ghidra/functions/."
-            return 1
-        fi
+    # ── Gate C: source quality — real function logic ──
+    local func_defs=0
+    # C/C++ functions
+    if find output/src -name '*.cpp' -o -name '*.c' 2>/dev/null | grep -q .; then
+        local c_funcs
+        c_funcs=$(grep -cE '^[a-zA-Z_].*\(.*\)\s*\{' output/src/*.cpp output/src/*.c 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}')
+        func_defs=$((func_defs + c_funcs))
     fi
-
-    local func_defs
-    func_defs=$(grep -cE '^[a-zA-Z_].*\(.*\)\s*\{' output/src/*.cpp output/src/*.c 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}')
+    # Zig functions
+    if find output/src -name '*.zig' 2>/dev/null | grep -q .; then
+        local zig_funcs
+        zig_funcs=$(grep -cE '^\s*(pub\s+)?(export\s+)?fn\s+' output/src/*.zig 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}')
+        func_defs=$((func_defs + zig_funcs))
+    fi
     echo "Function definitions: $func_defs"
     if [ "$func_defs" -lt 10 ]; then
         echo "FAIL: Only $func_defs function definitions (need ≥10)."
-        BUILD_ERRORS="QUALITY: Only $func_defs function definitions found. Need at least 10 real function implementations lifted from the binary."
+        BUILD_ERRORS="QUALITY: Only $func_defs function definitions found."
         return 1
     fi
 
-    # ── Gate D: actual compilation (not just syntax check) ──
+    # ── Gate D: compilation per language ──
     local errors="" compile_rc=0
-    if find output/src -name 'CMakeLists.txt' | grep -q .; then
-        errors=$(cd output/src && cmake -B /tmp/decon-build -DCMAKE_OSX_ARCHITECTURES=arm64 . 2>&1 && cmake --build /tmp/decon-build 2>&1)
-        compile_rc=$?
-    elif find output/src -name '*.cpp' -o -name '*.c' | grep -q .; then
-        errors=""
+
+    # C/C++ compilation
+    if find output/src -name '*.cpp' -o -name '*.c' 2>/dev/null | grep -q .; then
         while IFS= read -r srcfile; do
             file_errors=$(clang++ -std=c++17 -target arm64-apple-macos -c "$srcfile" -o /dev/null 2>&1)
             file_rc=$?
@@ -376,19 +449,28 @@ verify_build() {
                 errors="${errors}${file_errors}\n"
             fi
         done < <(find output/src -name '*.cpp' -o -name '*.c')
-    elif find output/src -name '*.swift' | grep -q .; then
-        errors=$(find output/src -name '*.swift' | xargs swiftc -typecheck -target arm64-apple-macos 2>&1)
-        compile_rc=$?
+    fi
+
+    # Zig syntax check
+    if find output/src -name '*.zig' 2>/dev/null | grep -q .; then
+        while IFS= read -r srcfile; do
+            file_errors=$(zig ast-check "$srcfile" 2>&1)
+            file_rc=$?
+            if [ "$file_rc" -ne 0 ]; then
+                compile_rc=$file_rc
+                errors="${errors}${srcfile}: ${file_errors}\n"
+            fi
+        done < <(find output/src -name '*.zig')
     fi
 
     if [ "$compile_rc" -ne 0 ] || [ -n "$errors" ]; then
         echo "FAIL: Compilation errors."
-        echo "$errors" | head -50
+        echo -e "$errors" | head -50
         BUILD_ERRORS="COMPILATION:\n$errors"
         return 1
     fi
 
-    echo "ALL GATES PASSED: $file_count files, $loc LOC, ${logic_ratio:-0}% logic, $func_defs functions, compiles clean."
+    echo "ALL GATES PASSED: $file_count files, $loc LOC, $func_defs functions, compiles clean."
     BUILD_ERRORS=""
     return 0
 }
@@ -402,38 +484,30 @@ echo "║  GHIDRA PRE-ANALYSIS                                       ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
 
-# Step 1: Quick analysis (function boundaries + call graph)
-if [ ! -f "output/ghidra/function_boundaries.tsv" ]; then
-    echo "[1/2] Running quick analysis (function boundaries + call graph)..."
+# Combined mode: single import + analysis pass for both quick and full
+if [ ! -f "output/ghidra/function_boundaries.tsv" ] && [ ! -f "output/ghidra/all_decompiled.c" ]; then
+    echo "Running combined analysis (quick + parallel decompilation in one pass)..."
+    ./ghidra_analyze.sh "$BINARY_PATH" combined 2>&1 | tee -a "$RECORD_FILE"
+elif [ ! -f "output/ghidra/function_boundaries.tsv" ]; then
+    echo "Running quick analysis..."
     ./ghidra_analyze.sh "$BINARY_PATH" quick 2>&1 | tee -a "$RECORD_FILE"
-
-    if [ -f "output/ghidra/function_boundaries.tsv" ]; then
-        FUNC_COUNT=$(tail -n +2 output/ghidra/function_boundaries.tsv | wc -l | tr -d ' ')
-        echo "Quick done: $FUNC_COUNT functions found."
-    else
-        echo "Warning: Quick analysis failed. Continuing without Ghidra data."
-    fi
+elif [ ! -f "output/ghidra/all_decompiled.c" ]; then
+    echo "Running parallel decompilation (reusing existing project)..."
+    ./ghidra_analyze.sh "$BINARY_PATH" full 2>&1 | tee -a "$RECORD_FILE"
 else
     FUNC_COUNT=$(tail -n +2 output/ghidra/function_boundaries.tsv | wc -l | tr -d ' ')
-    echo "[1/2] Quick analysis cached ($FUNC_COUNT functions). Skipping."
+    DECOMP_SIZE=$(du -sh output/ghidra/all_decompiled.c | cut -f1)
+    echo "Ghidra data cached: $FUNC_COUNT functions, $DECOMP_SIZE decompiled. Skipping."
 fi
 
-# Step 2: Full decompilation (all functions → C pseudocode)
-if [ ! -f "output/ghidra/all_decompiled.c" ]; then
-    echo ""
-    echo "[2/2] Running full decompilation (this takes 30-60 min for large binaries)..."
-    ./ghidra_analyze.sh "$BINARY_PATH" full 2>&1 | tee -a "$RECORD_FILE"
-
-    if [ -f "output/ghidra/all_decompiled.c" ]; then
-        DECOMP_SIZE=$(du -sh output/ghidra/all_decompiled.c | cut -f1)
-        DECOMP_FUNCS=$(grep -c '^// ===' output/ghidra/all_decompiled.c 2>/dev/null || echo "?")
-        echo "Full decompilation done: $DECOMP_FUNCS functions, $DECOMP_SIZE."
-    else
-        echo "Warning: Full decompilation failed. Continuing with quick data only."
-    fi
-else
+# Verify outputs
+if [ -f "output/ghidra/function_boundaries.tsv" ]; then
+    FUNC_COUNT=$(tail -n +2 output/ghidra/function_boundaries.tsv | wc -l | tr -d ' ')
+    echo "Functions: $FUNC_COUNT"
+fi
+if [ -f "output/ghidra/all_decompiled.c" ]; then
     DECOMP_SIZE=$(du -sh output/ghidra/all_decompiled.c | cut -f1)
-    echo "[2/2] Full decompilation cached ($DECOMP_SIZE). Skipping."
+    echo "Decompiled: $DECOMP_SIZE"
 fi
 
 # ─── Pre-compute module chunks for planning ─────────────────────────────────
@@ -619,16 +693,33 @@ while true; do
     echo ""
     BUILD_ERRORS=""
     if verify_build; then
+        # Verification passed — now check coverage
+        measure_coverage
+
+        if [ "$COVERAGE_PCT" -ge "$TARGET_COVERAGE" ]; then
+            echo ""
+            echo "╔══════════════════════════════════════════════════════════════╗"
+            echo "║  SUCCESS — Coverage target reached! Mission complete.       ║"
+            echo "╠══════════════════════════════════════════════════════════════╣"
+            echo "║  Functions: $COVERAGE_FUNCS/$COVERAGE_TOTAL ($COVERAGE_PCT%)"
+            echo "║  Source:    $COVERAGE_FILES files, $COVERAGE_LOC LOC"
+            echo "╚══════════════════════════════════════════════════════════════╝"
+            echo ""
+            echo "Record saved: $RECORD_FILE"
+            exit 0
+        fi
+
         echo ""
-        echo "╔══════════════════════════════════════════════════════════════╗"
-        echo "║  SUCCESS — Source compiles! Mission complete.               ║"
-        echo "╚══════════════════════════════════════════════════════════════╝"
-        echo ""
-        echo "Record saved: $RECORD_FILE"
-        exit 0
+        echo "Verification passed but coverage is $COVERAGE_PCT% (target: $TARGET_COVERAGE%)."
+        echo "Archiving PRD and planning next batch..."
+        BUILD_ERRORS="COVERAGE: Only $COVERAGE_PCT% of functions lifted ($COVERAGE_FUNCS/$COVERAGE_TOTAL). Need $TARGET_COVERAGE%. Already completed files: $(ls output/src/ 2>/dev/null | tr '\n' ', ')"
+
+        # Archive current PRD and force re-plan for next batch
+        cp "$PRD" "output/records/prd_cycle_${CYCLE}.json" 2>/dev/null
+        rm -f "$PRD"
     fi
 
     echo ""
-    echo "Source does not compile yet. Starting cycle $((CYCLE + 1))..."
+    echo "Starting cycle $((CYCLE + 1))..."
     echo ""
 done

@@ -1,11 +1,12 @@
 #!/bin/bash
 # Ghidra headless analysis wrapper for decon-agent
 #
-# Usage: ./ghidra_analyze.sh <binary_path> [full|quick]
+# Usage: ./ghidra_analyze.sh <binary_path> [full|quick|combined]
 #
 # Modes:
-#   quick  — Export function boundaries + call graph only (~5-10 min)
-#   full   — Full decompilation of all functions (~30-60 min for 182MB binary)
+#   quick    — Export function boundaries + call graph only (~5-10 min)
+#   full     — Full decompilation of all functions (parallel, ~10-20 min)
+#   combined — Single pass: quick + full in one import (fastest, saves ~17 min)
 #
 # Output goes to output/ghidra/
 
@@ -18,7 +19,7 @@ PROJECT_DIR="/tmp/ghidra-projects"
 OUTPUT_DIR="$(pwd)/output/ghidra"
 
 if [ -z "${1:-}" ]; then
-    echo "Usage: ./ghidra_analyze.sh <binary_path> [full|quick]"
+    echo "Usage: ./ghidra_analyze.sh <binary_path> [full|quick|combined]"
     exit 1
 fi
 
@@ -33,8 +34,8 @@ fi
 BINARY_NAME=$(basename "$BINARY_PATH")
 PROJECT_NAME="decon_${BINARY_NAME}"
 
-# Clean stale locks from previous runs, then ensure dirs exist
-rm -rf "${PROJECT_DIR:?}/${PROJECT_NAME}" "${PROJECT_DIR:?}/${PROJECT_NAME}.rep" "${PROJECT_DIR:?}/${PROJECT_NAME}.lock" 2>/dev/null
+# Clean stale locks (but keep project if it exists for reuse)
+rm -f "${PROJECT_DIR:?}/${PROJECT_NAME}.lock" 2>/dev/null
 mkdir -p "$PROJECT_DIR" "$OUTPUT_DIR"
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -46,27 +47,42 @@ echo "Output:  $OUTPUT_DIR"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
+# Check if project already exists (can reuse analysis)
+IMPORT_ARGS=("-import" "$BINARY_PATH")
+if [ -d "${PROJECT_DIR}/${PROJECT_NAME}.rep" ]; then
+    echo "Reusing existing Ghidra project (skipping re-import + re-analysis)"
+    IMPORT_ARGS=("-process" "$BINARY_NAME")
+fi
+
 if [ "$MODE" = "quick" ]; then
     echo "Running quick analysis (function boundaries + call graph)..."
     "$GHIDRA_HEADLESS" "$PROJECT_DIR" "$PROJECT_NAME" \
-        -import "$BINARY_PATH" \
+        "${IMPORT_ARGS[@]}" \
         -scriptPath "$SCRIPTS_DIR" \
         -postScript ExportFunctionInfo.java "$OUTPUT_DIR" \
-        -deleteProject \
         -analysisTimeoutPerFile 3600 \
         2>&1 | tee "$OUTPUT_DIR/ghidra_analysis.log"
 
 elif [ "$MODE" = "full" ]; then
-    echo "Running full decompilation (this will take a while)..."
+    echo "Running full parallel decompilation..."
     "$GHIDRA_HEADLESS" "$PROJECT_DIR" "$PROJECT_NAME" \
-        -import "$BINARY_PATH" \
+        "${IMPORT_ARGS[@]}" \
         -scriptPath "$SCRIPTS_DIR" \
-        -postScript DecompileAll.java "$OUTPUT_DIR" \
-        -deleteProject \
+        -postScript DecompileAllParallel.java "$OUTPUT_DIR" \
+        -analysisTimeoutPerFile 7200 \
+        2>&1 | tee "$OUTPUT_DIR/ghidra_analysis.log"
+
+elif [ "$MODE" = "combined" ]; then
+    echo "Running combined analysis (quick + full parallel decompilation in one pass)..."
+    "$GHIDRA_HEADLESS" "$PROJECT_DIR" "$PROJECT_NAME" \
+        "${IMPORT_ARGS[@]}" \
+        -scriptPath "$SCRIPTS_DIR" \
+        -postScript ExportFunctionInfo.java "$OUTPUT_DIR" \
+        -postScript DecompileAllParallel.java "$OUTPUT_DIR" \
         -analysisTimeoutPerFile 7200 \
         2>&1 | tee "$OUTPUT_DIR/ghidra_analysis.log"
 else
-    echo "Unknown mode: $MODE (use 'quick' or 'full')"
+    echo "Unknown mode: $MODE (use 'quick', 'full', or 'combined')"
     exit 1
 fi
 
