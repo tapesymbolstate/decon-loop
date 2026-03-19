@@ -55,34 +55,62 @@ RECORD_FILE="output/records/$(date '+%Y-%m-%d-%H%M%S')-decon-$TOOL.log"
 # ─── Prompt: initial plan (cycle 1) ─────────────────────────────────────────
 
 gen_plan_prompt() {
+    local mapping_section=""
+    if [ "$HAS_FUNCTION_MAP" = true ]; then
+        mapping_section="
+## Reference source mapping (AVAILABLE — use hybrid strategy)
+- \`output/mapping/function_map.tsv\` — maps Ghidra functions to original source files with columns:
+  ghidra_function_name, ghidra_address, source_file, source_line, confidence, match_method, original_name, source_language
+- \`output/mapping/helper_aliases.tsv\` — maps FUN_* names to meaningful original names
+- \`output/mapping/stats.json\` — mapping coverage summary
+- \`reference-src/\` — cloned original source code
+
+HYBRID STRATEGY: For functions that have mappings (check function_map.tsv), the agent will
+read BOTH the Ghidra pseudocode AND the original source, then produce output that matches
+the original code quality. Prioritize mapped functions — they produce the best results.
+
+When planning tasks:
+- Read output/mapping/stats.json to understand coverage
+- Group tasks by SOURCE FILE (not just address), using the source_file column from function_map.tsv
+- For tasks with mapped functions: set \`sourceFiles\` field listing the original source files
+- Order: high-confidence mapped functions first, then medium, then unmapped
+- Output language should match the original: .zig for Zig source, .cpp for C++ source
+"
+    else
+        mapping_section="
+## No reference source mapping available — use pure reversing strategy
+The binary's original source was not identified or is not open source.
+All lifting must be done from Ghidra pseudocode alone.
+"
+    fi
+
     cat <<PLAN_EOF
-You are an autonomous binary decompilation planner. Your ONLY goal is to plan how to LIFT Ghidra-decompiled functions into clean, compilable C/C++ source files.
+You are an autonomous source reconstruction planner. Your goal is to plan how to reconstruct real, readable source code from a decompiled binary.
 
 ## Target
 Binary file: \`$BINARY_PATH\`
 
-## Available Ghidra data (already generated)
-- \`output/ghidra/function_boundaries.tsv\` — TSV with columns: name, entry_address, end_address, size, param_count, return_type, calling_convention, is_thunk, is_external
-- \`output/ghidra/call_graph.tsv\` — TSV with columns: caller_name, caller_address, callee_name, callee_address, ref_type
-- \`output/ghidra/all_decompiled.c\` — Full Ghidra C pseudocode for all functions
+## Available Ghidra data
+- \`output/ghidra/function_boundaries.tsv\` — all detected functions (name, address, size, params, return_type)
+- \`output/ghidra/call_graph.tsv\` — caller→callee relationships
+- \`output/ghidra/all_decompiled.c\` — Full Ghidra C pseudocode
 - \`output/ghidra/functions/<prefix>/<funcname>_<addr>.c\` — Individual function decompilations
-
+- \`output/ghidra/module_chunks.tsv\` — address-prefix groupings with function counts
+$mapping_section
 ## Steps
 
-1. Quick recon (brief — spend most effort on Ghidra data):
+1. Quick recon:
    - \`file $BINARY_PATH\` / \`otool -h $BINARY_PATH\` / \`otool -L $BINARY_PATH\`
-   - \`wc -l output/ghidra/function_boundaries.tsv\` (total function count)
+   - \`wc -l output/ghidra/function_boundaries.tsv\` (function count)
+   - If mapping exists: \`cat output/mapping/stats.json\` (coverage)
+   - If mapping exists: \`head -30 output/mapping/function_map.tsv\` (sample mappings)
 
-2. Analyze Ghidra function data to plan module chunking:
-   - Read \`output/ghidra/function_boundaries.tsv\` — count functions, identify named vs unnamed (FUN_*)
-   - Sample 10-20 decompiled functions from \`output/ghidra/functions/\` to assess pseudocode quality
-   - Read first 500 lines of \`output/ghidra/call_graph.tsv\` to understand connectivity
-   - Group functions into logical modules by:
-     (a) Address proximity (functions at adjacent addresses often belong to the same compilation unit)
-     (b) Call graph clusters (functions that call each other heavily)
-     (c) String references and import patterns
+2. Plan module grouping:
+   - If mapping exists: group by source_file from function_map.tsv
+   - If no mapping: group by address proximity + call graph clusters
+   - Sample decompiled functions to assess pseudocode quality
 
-3. Create directories: \`mkdir -p output/{headers,symbols,strings,reports,src,records}\`
+3. Create: \`mkdir -p output/{headers,symbols,strings,reports,src,records}\`
 
 4. Generate \`output/prd.json\` with schema:
    \`\`\`json
@@ -90,32 +118,28 @@ Binary file: \`$BINARY_PATH\`
      "userStories": [{ "id": "US-001", "title": "...", "description": "...",
        "ghidraFunctions": ["FUN_XXXXX", "FUN_YYYYY"],
        "addressRange": "0x100XXXX-0x100YYYY",
-       "targetSourceFile": "output/src/module_name.cpp",
+       "sourceFiles": ["src/path/to/original.zig"],
+       "targetSourceFile": "output/src/module_name.zig",
        "acceptanceCriteria": ["..."], "priority": 1, "passes": false, "notes": "" }] }
    \`\`\`
 
-   CRITICAL task planning rules:
-   - Task 1 MUST be "Create shared type definitions header" — scan Ghidra pseudocode for common types (undefined8→uint64_t, undefined4→uint32_t, etc.) and struct patterns, produce \`output/src/types.h\`
-   - Tasks 2+ are "Lift module X functions" — each task covers 20-200 related functions
-   - Each task MUST specify:
-     \`ghidraFunctions\`: list of Ghidra function names to lift
-     \`addressRange\`: address range covered
-     \`targetSourceFile\`: output .cpp/.h file path
-   - Accept criteria MUST include: "output/src/<file>.cpp contains lifted function implementations" and "compiles with clang++ -c"
-   - 10-25 tasks total, ordered by dependency (types first, then utilities, then subsystems)
+   Task planning rules:
+   - Task 1: "Create shared type definitions" from Ghidra type patterns
+   - Tasks 2+: "Reconstruct <module>" — each covers 20-200 related functions
+   - Each task MUST specify \`ghidraFunctions\`, \`addressRange\`, \`targetSourceFile\`
+   - If mapping exists: include \`sourceFiles\` listing the original source paths
+   - Output file extension MUST match source language (.zig, .cpp, .c, .rs etc.)
+   - 10-25 tasks, ordered by dependency
+   - DO NOT create analysis-only tasks
 
-   DO NOT create analysis tasks like "extract symbols", "triage strings", "map dependencies".
-   Every task must produce actual C/C++ function implementations in output/src/.
-
-5. Generate \`output/progress.txt\` with recon summary and empty \`## Iteration Log\`.
+5. Generate \`output/progress.txt\` with recon summary.
 
 ## Rules
 - NEVER modify the target binary. All output inside \`output/\`.
-- Every PRD task must produce or improve .cpp/.h files in \`output/src/\`
-- The output source must contain REAL function bodies lifted from Ghidra pseudocode, not metadata structs
+- Every task must produce real source code in \`output/src/\`
 
 ## Completion
-When output/prd.json and output/progress.txt are created, output: <promise>PLAN_COMPLETE</promise>
+When done, output: <promise>PLAN_COMPLETE</promise>
 PLAN_EOF
 }
 
@@ -124,125 +148,143 @@ PLAN_EOF
 gen_replan_prompt() {
     local cycle_num="$1"
     local build_errors="$2"
+
+    local mapping_note=""
+    if [ "$HAS_FUNCTION_MAP" = true ]; then
+        mapping_note="
+- \`output/mapping/function_map.tsv\` — function→source mappings
+- \`output/mapping/helper_aliases.tsv\` — FUN_*→original name aliases
+- \`reference-src/\` — original source (use for hybrid lifting)
+"
+    fi
+
     cat <<REPLAN_EOF
-You are an autonomous function-lifting planner running cycle $cycle_num. The previous cycle's tasks are done but verification FAILED.
+You are a source reconstruction planner running cycle $cycle_num. Verification FAILED.
 
 ## Target
 Binary file: \`$BINARY_PATH\`
 
-## Failure from last verification
+## Failure
 \`\`\`
 $build_errors
 \`\`\`
 
-## Diagnosing the failure
+## Diagnosis
+- "QUALITY:" → source is metadata/stubs, not real code. Delete and re-lift from Ghidra.
+- "COMPILATION:" → real code but compile errors. Fix specific issues.
 
-If the error starts with "QUALITY:":
-→ The source files do NOT contain real lifted function implementations. They contain metadata/struct literals.
-→ You MUST: run \`rm -f output/src/*.cpp output/src/*.hpp output/src/*.h\` to delete all metadata files
-→ Then plan fresh function-lifting tasks that read Ghidra pseudocode and produce real code
-
-If the error starts with "COMPILATION:":
-→ The source has real function implementations but doesn't compile
-→ Analyze the specific compiler errors to plan targeted fixes
-
-## Current state
-- \`output/progress.txt\` — all prior findings
-- \`output/prd.json\` — previous PRD (all passes: true)
-- \`output/src/\` — current source files (may need deletion if quality failure)
-- \`output/ghidra/function_boundaries.tsv\` — all functions
-- \`output/ghidra/call_graph.tsv\` — call graph
-- \`output/ghidra/all_decompiled.c\` — full Ghidra C pseudocode
-- \`output/ghidra/functions/\` — individual function decompilations
-
-## Your job
+## Available data
+- \`output/progress.txt\`, \`output/prd.json\`, \`output/src/\`
+- \`output/ghidra/function_boundaries.tsv\`, \`call_graph.tsv\`, \`functions/\`
+$mapping_note
+## Job
 1. Archive: \`cp output/prd.json output/records/prd_cycle_$((cycle_num - 1)).json\`
-2. If QUALITY failure: delete metadata source files, start fresh with function lifting
-3. If COMPILATION failure: analyze errors, plan fixes for missing types/headers/implementations
-4. Generate NEW \`output/prd.json\` with \`"cycle": $cycle_num\`:
-   - Every task MUST have \`ghidraFunctions\`, \`addressRange\`, \`targetSourceFile\`
-   - Every task MUST produce real C/C++ function implementations from Ghidra pseudocode
-   - Accept criteria MUST include "compiles with clang++ -c" and "contains N function implementations"
-   - Order: shared types.h first → utility functions → subsystem modules
-5. Append cycle transition note to \`output/progress.txt\`
-
-## Rules
-- NEVER modify the target binary. All output inside \`output/\`.
-- Every task must produce LIFTED function implementations, not analysis artifacts.
-- Tasks must reference specific Ghidra function names to lift.
+2. If QUALITY failure: \`rm -f output/src/*\`, start fresh
+3. Generate NEW \`output/prd.json\` (\`"cycle": $cycle_num\`):
+   - Every task: \`ghidraFunctions\`, \`addressRange\`, \`targetSourceFile\`
+   - If mapping available: include \`sourceFiles\`, match output language to original
+   - Output must be real source code, not analysis artifacts
+4. Append cycle note to \`output/progress.txt\`
 
 ## Completion
-When new output/prd.json is ready, output: <promise>PLAN_COMPLETE</promise>
+When ready, output: <promise>PLAN_COMPLETE</promise>
 REPLAN_EOF
 }
 
 # ─── Prompt: build (same for all cycles) ────────────────────────────────────
 
 gen_build_prompt() {
+    local mapping_section=""
+    if [ "$HAS_FUNCTION_MAP" = true ]; then
+        mapping_section="
+## Reference source mapping (AVAILABLE)
+- \`output/mapping/function_map.tsv\` — maps Ghidra function → original source file:line
+- \`output/mapping/helper_aliases.tsv\` — maps FUN_* → meaningful names
+- \`reference-src/\` — original source code
+
+### HYBRID WORKFLOW (for functions with mappings):
+1. Look up the function in \`output/mapping/function_map.tsv\`
+2. Read the ORIGINAL source at the mapped file:line in \`reference-src/\`
+3. Read the Ghidra pseudocode to verify correspondence (check control flow matches)
+4. Write output that matches the ORIGINAL source — same language, names, types, idioms
+5. Add a comment with the Ghidra address for traceability: \`// @ghidra: 0x100XXXXXX\`
+
+### LANGUAGE RULES:
+- If original is .zig → write .zig output (use Zig syntax, types, error handling)
+- If original is .cpp/.c → write .cpp/.c output
+- If original is .rs → write .rs output
+- Unmapped functions → write .c output (cleaned Ghidra pseudocode)
+
+### NAME RESTORATION:
+- Use \`helper_aliases.tsv\` to rename FUN_* calls to their original names
+- Use the mapping to restore parameter names, types, and variable names from the original
+"
+    else
+        mapping_section="
+## No reference source — pure reversing mode
+All lifting must be from Ghidra pseudocode alone.
+Clean up types (undefined8→uint64_t), infer meaningful names from context.
+"
+    fi
+
     cat <<BUILD_EOF
-You are an autonomous function-lifting agent. Your job: read Ghidra decompiled C pseudocode and transform it into clean, compilable C/C++ source.
+You are an autonomous source reconstruction agent. Your job: produce clean, readable source code that faithfully represents the binary's logic.
 
 ## Target
 Binary file: \`$BINARY_PATH\`
 
 ## Context — read FIRST
-1. \`output/prd.json\` — task list with \`ghidraFunctions\` and \`targetSourceFile\` per task
+1. \`output/prd.json\` — task list with \`ghidraFunctions\`, \`targetSourceFile\`, and optionally \`sourceFiles\`
 2. \`output/progress.txt\` — cumulative findings
-
-## Workflow for each task
+$mapping_section
+## Workflow
 
 ### Step 1: Identify your task
 Read \`output/prd.json\`, find the highest-priority task where \`passes\` is \`false\`.
-Note the \`ghidraFunctions\` list, \`addressRange\`, and \`targetSourceFile\`.
 
-### Step 2: Read Ghidra pseudocode
-For each function in \`ghidraFunctions\`:
-- Find it in \`output/ghidra/functions/\` (organized by address prefix subdirectories)
-- Or grep for it in \`output/ghidra/all_decompiled.c\`: \`grep -A 100 "=== FUNCNAME @" output/ghidra/all_decompiled.c\`
-- Read the raw Ghidra C pseudocode
+### Step 2: For each function in the task
 
-### Step 3: Clean up and lift each function
-Transform the Ghidra pseudocode into proper C/C++:
-- \`undefined8\` → \`uint64_t\`, \`undefined4\` → \`uint32_t\`, \`undefined2\` → \`uint16_t\`, \`undefined1\` → \`uint8_t\`
-- \`undefined\` → \`uint8_t\` (or appropriate type from context)
-- \`FUN_XXXXXXXXX\` → meaningful name based on what the function does (analyze string refs, call patterns, operations)
-- \`param_1\`, \`param_2\` → meaningful parameter names based on usage
-- \`uVar1\`, \`lVar2\` → meaningful local variable names
-- \`*(long *)(param_1 + 0x38)\` → keep as pointer arithmetic (or use struct if layout is known)
-- Preserve ALL control flow exactly: every if/while/for/switch/goto must match the original
-- Do NOT invent functionality — only clean up what Ghidra produced
-- Add \`#include <cstdint>\`, \`<cstring>\`, \`<cstdlib>\` as needed
+**If mapping exists for this function** (check function_map.tsv):
+a) Read the original source from \`reference-src/<source_file>\` at the mapped line
+b) Read the Ghidra pseudocode from \`output/ghidra/functions/\`
+c) Verify they correspond (similar control flow, string references)
+d) Write the ORIGINAL source code, adapting minimally:
+   - Keep original function name, parameter names, types
+   - Keep original language (Zig/C++/Rust/etc.)
+   - Add \`// @ghidra: <address>\` comment for traceability
+   - Replace any remaining FUN_* calls with mapped names from helper_aliases.tsv
 
-### Step 4: Write source files
-- Write the header: \`output/src/<module>.h\` with function declarations and type definitions
-- Write the implementation: \`output/src/<module>.cpp\` with cleaned function bodies
-- For functions that call not-yet-lifted functions, declare them as \`extern\` in the header
-- \`#include "types.h"\` if it exists (shared type definitions from task 1)
+**If NO mapping exists** (pure Ghidra lifting):
+a) Read the Ghidra pseudocode
+b) Clean up: \`undefined8\`→\`uint64_t\`, \`FUN_*\`→meaningful name, \`param_N\`→descriptive name
+c) Infer function purpose from string refs, call patterns, operations
+d) Preserve ALL control flow exactly
+e) Write as clean C
 
-### Step 5: Compile and verify
-Run: \`clang++ -std=c++17 -target arm64-apple-macos -c output/src/<module>.cpp -o /dev/null 2>&1\`
-- Do NOT use \`-fsyntax-only\` — use \`-c\` for real compilation
-- Do NOT append \`|| true\` — you need to see errors
-- If compilation fails, fix the errors before marking the task as done
-- Only set \`passes: true\` if compilation succeeds
+### Step 3: Write source files
+- Use the language matching the original source (or .c for unmapped)
+- For functions calling not-yet-lifted functions, declare them as \`extern\`
+- Include \`types.h\` if needed for Ghidra type aliases
 
-### Step 6: Update state
-- Update \`output/prd.json\`: set \`passes: true\`, record function count and notes
-- Append to \`output/progress.txt\`: what functions you lifted, key findings
+### Step 4: Compile and verify
+- C/C++: \`clang++ -std=c++17 -target arm64-apple-macos -c <file> -o /dev/null 2>&1\`
+- Zig: \`zig ast-check <file> 2>&1\` (syntax check only if full build not possible)
+- Do NOT use \`|| true\` — you need to detect failures
+- Only set \`passes: true\` if verification succeeds
+
+### Step 5: Update state
+- Update \`output/prd.json\`: set \`passes: true\`, note function count and accuracy
+- Append to \`output/progress.txt\`
 
 ## CRITICAL RULES
-- You MUST read Ghidra decompiled functions as your PRIMARY input
-- Every function you write MUST correspond to a real Ghidra-decompiled function
-- Output MUST contain actual function implementations with real logic (if/while/for/switch)
-- Struct literals containing strings that describe the binary are NOT acceptable
-- Do NOT produce "analysis artifacts" or "metadata models" — produce LIFTED CODE
+- Output must be REAL SOURCE CODE — readable, with meaningful names and proper types
+- If reference source exists, your output should MATCH it as closely as possible
+- Struct literals / metadata describing the binary are NOT acceptable
 - ONE task per iteration
 - NEVER modify the target binary
 
 ## Completion
-If ALL tasks have \`passes: true\`, output exactly:
-<promise>CYCLE_DONE</promise>
-
+If ALL tasks have \`passes: true\`, output: <promise>CYCLE_DONE</promise>
 Otherwise, complete your one task and exit.
 BUILD_EOF
 }
@@ -428,6 +470,57 @@ with open('output/ghidra/module_chunks.tsv', 'w') as out:
         CHUNK_COUNT=$(tail -n +2 output/ghidra/module_chunks.tsv | wc -l | tr -d ' ')
         echo "Module chunks: $CHUNK_COUNT address-prefix groups."
     fi
+fi
+
+# ─── Phase 0.5: Source discovery + mapping ───────────────────────────────────
+
+HAS_REFERENCE_SOURCE=false
+HAS_FUNCTION_MAP=false
+
+echo "╔══════════════════════════════════════════════════════════════╗"
+echo "║  SOURCE DISCOVERY & MAPPING                                 ║"
+echo "╚══════════════════════════════════════════════════════════════╝"
+echo ""
+
+# Step 1: Discover what the binary is
+if [ ! -f "output/discovery/identity.json" ]; then
+    echo "[1/3] Identifying binary..."
+    python3 discover_source.py "$BINARY_PATH" --clone 2>&1 | tee -a "$RECORD_FILE"
+else
+    echo "[1/3] Identity cached."
+    cat output/discovery/identity.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'  {d.get(\"name\",\"?\")}{\" \"+d[\"version\"] if d.get(\"version\") else \"\"} (confidence: {d.get(\"confidence\",\"?\")})')" 2>/dev/null
+fi
+
+# Step 2: Check if reference source exists
+if [ -f "output/discovery/identity.json" ]; then
+    SOURCE_NAME=$(python3 -c "import json; d=json.load(open('output/discovery/identity.json')); print(d.get('name',''))" 2>/dev/null)
+    SOURCE_DIR="reference-src/${SOURCE_NAME}"
+
+    if [ -n "$SOURCE_NAME" ] && [ -d "$SOURCE_DIR" ]; then
+        HAS_REFERENCE_SOURCE=true
+        echo "[2/3] Reference source: $SOURCE_DIR"
+    elif [ -n "$SOURCE_NAME" ]; then
+        echo "[2/3] Cloning reference source..."
+        python3 discover_source.py "$BINARY_PATH" --clone 2>&1 | tee -a "$RECORD_FILE"
+        [ -d "$SOURCE_DIR" ] && HAS_REFERENCE_SOURCE=true
+    else
+        echo "[2/3] No source identified. Using pure reversing (Approach A only)."
+    fi
+else
+    echo "[2/3] No identity. Using pure reversing (Approach A only)."
+fi
+
+# Step 3: Build function-to-source mapping
+if [ "$HAS_REFERENCE_SOURCE" = true ] && [ ! -f "output/mapping/function_map.tsv" ]; then
+    echo "[3/3] Building function→source mapping..."
+    python3 map_to_source.py "$BINARY_PATH" 2>&1 | tee -a "$RECORD_FILE"
+    [ -f "output/mapping/function_map.tsv" ] && HAS_FUNCTION_MAP=true
+elif [ -f "output/mapping/function_map.tsv" ]; then
+    HAS_FUNCTION_MAP=true
+    MAP_COUNT=$(tail -n +2 output/mapping/function_map.tsv | wc -l | tr -d ' ')
+    echo "[3/3] Function mapping cached ($MAP_COUNT entries)."
+else
+    echo "[3/3] No mapping available. Proceeding with Ghidra data only."
 fi
 
 echo ""

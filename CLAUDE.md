@@ -28,31 +28,48 @@ All binaries to analyze are in `target-binaries/`. The loop script passes the sp
 The loop repeats **Plan → Build → Verify** until source compiles AND passes quality gates:
 
 ### Phase 0: Ghidra Pre-Analysis (once)
-- Quick: extract function boundaries + call graph → `output/ghidra/function_boundaries.tsv`, `call_graph.tsv`
+- Quick: function boundaries + call graph → `output/ghidra/function_boundaries.tsv`, `call_graph.tsv`
 - Full: decompile all functions → `output/ghidra/all_decompiled.c`, `output/ghidra/functions/`
-- Pre-compute module chunks → `output/ghidra/module_chunks.tsv`
+- Module chunks → `output/ghidra/module_chunks.tsv`
 
-### Phase 1: Plan (function-lifting PRD)
-- Cycle 1: Analyze Ghidra data, group functions into modules, create lifting tasks
-- Cycle 2+: Read verification errors (compilation or quality), re-plan with targeted fixes
-- Every PRD task must specify `ghidraFunctions`, `addressRange`, `targetSourceFile`
-- NO analysis-only tasks — every task must produce lifted code in `output/src/`
+### Phase 0.5: Source Discovery & Mapping (once, automatic)
+The harness automatically tries to identify the binary and find its source:
+1. **`discover_source.py`** — analyzes strings, symbols, embedded paths to identify the software
+   - Outputs `output/discovery/identity.json` (name, version, repo URL, languages, confidence)
+   - Maintains a known-software database (Bun, Node, Deno, Redis, nginx, etc.) but also does generic detection
+   - If identified: shallow-clones the source to `reference-src/<name>/`
+2. **`map_to_source.py`** — maps Ghidra functions to original source locations
+   - Direct symbol matching (named functions → source function index)
+   - String-anchored matching (embedded file paths, error messages → source grep)
+   - Call graph propagation (known functions' callees → source callees)
+   - Outputs `output/mapping/function_map.tsv`, `helper_aliases.tsv`, `stats.json`
 
-### Phase 2: Build (lift Ghidra pseudocode → clean C/C++)
-- Read Ghidra decompiled functions from `output/ghidra/functions/`
-- Transform: `undefined8`→`uint64_t`, `FUN_*`→meaningful names, `param_N`→descriptive names
-- Preserve all control flow exactly — no invented functionality
-- Compile each module with `clang++ -c` (not `-fsyntax-only`)
-- When all PRD tasks pass → `<promise>CYCLE_DONE</promise>`
+If discovery fails (closed-source binary), the pipeline falls back to pure Ghidra lifting.
+
+### Phase 1: Plan
+- If mapping exists: group tasks by SOURCE FILE, prioritize high-confidence mappings
+- If no mapping: group by address proximity + call graph clusters
+- Every task: `ghidraFunctions`, `addressRange`, `targetSourceFile`, optionally `sourceFiles`
+- Output file extension matches source language (.zig, .cpp, .c, .rs)
+
+### Phase 2: Build (hybrid or pure lifting)
+**Hybrid mode** (when reference source is available):
+- Read Ghidra pseudocode AND original source for each mapped function
+- Produce output matching the original: same language, names, types, idioms
+- Unmapped functions fall back to cleaned Ghidra pseudocode
+
+**Pure mode** (closed-source binary):
+- Read Ghidra pseudocode, clean up types/names, infer meaning from context
+- Output as clean C/C++
 
 ### Phase 3: Verify (4 quality gates)
-1. **Source exists**: files present in `output/src/`
+1. **Source exists**: files in `output/src/`
 2. **Quantity**: ≥500 LOC, ≥5 files
-3. **Quality**: ≥25% logic density (if/while/for/switch), ≥10 function definitions — rejects metadata-only stubs
-4. **Compilation**: `clang++ -c` succeeds (not syntax-only)
+3. **Quality**: ≥25% logic density, ≥10 function definitions
+4. **Compilation**: `clang++ -c` / `zig ast-check` succeeds
 
 ### Completion criteria
-Source in `output/src/` passes ALL 4 verification gates. Not just "compiles" — must contain real lifted function implementations from Ghidra decompilation.
+Source passes all 4 gates. Must contain real function implementations, not metadata.
 
 ## Analysis Tools
 
@@ -72,16 +89,18 @@ Binary analysis tools to invoke via Bash:
 
 ```
 output/
+├── ghidra/           # Ghidra pre-analysis (function_boundaries, call_graph, decompiled functions)
+├── discovery/        # Binary identity detection (identity.json)
+├── mapping/          # Function→source mappings (function_map.tsv, helper_aliases.tsv)
 ├── headers/          # Mach-O headers, load commands
 ├── symbols/          # Symbol tables, exports/imports
-├── strings/          # Extracted strings (categorized)
-├── classes/          # Class/struct definitions
-├── protocols/        # Protocols/interfaces
+├── strings/          # Extracted strings
 ├── functions/        # Key function disassembly
-├── diff/             # Cross-version differences
-├── reports/          # Comprehensive analysis reports
-├── obfuscation/      # Raw obfuscated artifacts + deobfuscation notes
-└── src/              # Reconstructed buildable source code
+├── reports/          # Analysis reports
+├── records/          # Execution logs per run
+└── src/              # Reconstructed source code (Zig, C++, C — matching original language)
+
+reference-src/        # Cloned original source (gitignored, auto-detected)
 ```
 
 ## Build Verification
