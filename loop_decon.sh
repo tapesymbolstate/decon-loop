@@ -325,8 +325,15 @@ verify_build() {
         errors=$(cd output/src && cmake -B /tmp/decon-build -DCMAKE_OSX_ARCHITECTURES=arm64 . 2>&1 && cmake --build /tmp/decon-build 2>&1)
         compile_rc=$?
     elif find output/src -name '*.cpp' -o -name '*.c' | grep -q .; then
-        errors=$(find output/src -name '*.cpp' -o -name '*.c' | xargs clang++ -std=c++17 -target arm64-apple-macos -c -o /dev/null 2>&1)
-        compile_rc=$?
+        errors=""
+        while IFS= read -r srcfile; do
+            file_errors=$(clang++ -std=c++17 -target arm64-apple-macos -c "$srcfile" -o /dev/null 2>&1)
+            file_rc=$?
+            if [ "$file_rc" -ne 0 ]; then
+                compile_rc=$file_rc
+                errors="${errors}${file_errors}\n"
+            fi
+        done < <(find output/src -name '*.cpp' -o -name '*.c')
     elif find output/src -name '*.swift' | grep -q .; then
         errors=$(find output/src -name '*.swift' | xargs swiftc -typecheck -target arm64-apple-macos 2>&1)
         compile_rc=$?
