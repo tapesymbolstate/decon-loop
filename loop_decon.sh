@@ -41,9 +41,10 @@ if [ "${1:-}" = "codex" ] || [ "${1:-}" = "claude" ]; then
 fi
 
 MAX_ITERATIONS=${1:-0}
-TARGET_COVERAGE=${TARGET_COVERAGE:-80}
+TARGET_COVERAGE=${TARGET_COVERAGE:-100}
 ITERATION=0
 CYCLE=0
+BUILD_ERRORS=""
 
 PRD="output/prd.json"
 PROGRESS="output/progress.txt"
@@ -126,11 +127,11 @@ $mapping_section
 
    Task planning rules:
    - Task 1: "Create shared type definitions" from Ghidra type patterns
-   - Tasks 2+: "Reconstruct <module>" — each covers 20-200 related functions
+   - Tasks 2+: "Reconstruct <module>" — each covers 50-500 related functions
    - Each task MUST specify \`ghidraFunctions\`, \`addressRange\`, \`targetSourceFile\`
    - If mapping exists: include \`sourceFiles\` listing the original source paths
    - Output file extension MUST match source language (.zig, .cpp, .c, .rs etc.)
-   - 10-25 tasks, ordered by dependency
+   - 20-40 tasks, ordered by dependency. Maximize function coverage per task.
    - DO NOT create analysis-only tasks
 
 5. Generate \`output/progress.txt\` with recon summary.
@@ -320,11 +321,12 @@ spawn_agent() {
     if [ "$TOOL" = "codex" ]; then
         echo "$prompt" | codex exec \
             --full-auto \
-            -c 'model_reasoning_effort="high"' \
+            --model "${CODEX_MODEL:-gpt-5.4}" \
             2>&1 || true
     else
         claude -p \
-            --model sonnet \
+            --model opus \
+            --effort "${CLAUDE_EFFORT:-max}" \
             --permission-mode bypassPermissions \
             --dangerously-skip-permissions \
             "$prompt" \
@@ -351,12 +353,12 @@ measure_coverage() {
     lifted_funcs=0
     if find output/src -name '*.cpp' -o -name '*.c' 2>/dev/null | grep -q .; then
         local c_funcs
-        c_funcs=$(grep -cE '^[a-zA-Z_].*\(.*\)\s*\{' output/src/*.cpp output/src/*.c 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}')
+        c_funcs=$(find output/src \( -name '*.cpp' -o -name '*.c' \) -exec grep -cE '^[a-zA-Z_].*\(.*\)\s*\{' {} \; 2>/dev/null | awk '{s+=$1}END{print s+0}')
         lifted_funcs=$((lifted_funcs + c_funcs))
     fi
     if find output/src -name '*.zig' 2>/dev/null | grep -q .; then
         local zig_funcs
-        zig_funcs=$(grep -cE '^\s*(pub\s+)?(export\s+)?fn\s+' output/src/*.zig 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}')
+        zig_funcs=$(find output/src -name '*.zig' -exec grep -cE '^\s*(pub\s+)?(export\s+)?fn\s+' {} \; 2>/dev/null | awk '{s+=$1}END{print s+0}')
         lifted_funcs=$((lifted_funcs + zig_funcs))
     fi
 
@@ -420,13 +422,13 @@ verify_build() {
     # C/C++ functions
     if find output/src -name '*.cpp' -o -name '*.c' 2>/dev/null | grep -q .; then
         local c_funcs
-        c_funcs=$(grep -cE '^[a-zA-Z_].*\(.*\)\s*\{' output/src/*.cpp output/src/*.c 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}')
+        c_funcs=$(find output/src \( -name '*.cpp' -o -name '*.c' \) -exec grep -cE '^[a-zA-Z_].*\(.*\)\s*\{' {} \; 2>/dev/null | awk '{s+=$1}END{print s+0}')
         func_defs=$((func_defs + c_funcs))
     fi
     # Zig functions
     if find output/src -name '*.zig' 2>/dev/null | grep -q .; then
         local zig_funcs
-        zig_funcs=$(grep -cE '^\s*(pub\s+)?(export\s+)?fn\s+' output/src/*.zig 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}')
+        zig_funcs=$(find output/src -name '*.zig' -exec grep -cE '^\s*(pub\s+)?(export\s+)?fn\s+' {} \; 2>/dev/null | awk '{s+=$1}END{print s+0}')
         func_defs=$((func_defs + zig_funcs))
     fi
     echo "Function definitions: $func_defs"
@@ -603,6 +605,24 @@ echo ""
 # MAIN LOOP: Plan → Build → Verify → Re-plan if needed
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Handle resume: if PRD exists with all tasks done, skip straight to verify+coverage
+if [ -f "$PRD" ] && ! python3 -c "import json,sys; d=json.load(open('$PRD')); sys.exit(0 if any(not s['passes'] for s in d['userStories']) else 1)" 2>/dev/null; then
+    echo "Existing PRD found with all tasks complete. Checking coverage..."
+    CYCLE=$((CYCLE + 1))
+    BUILD_ERRORS=""
+    if verify_build; then
+        measure_coverage
+        if [ "$COVERAGE_PCT" -ge "$TARGET_COVERAGE" ]; then
+            echo "Coverage target already met ($COVERAGE_PCT%). Nothing to do."
+            exit 0
+        fi
+        echo "Coverage: $COVERAGE_PCT% (target: $TARGET_COVERAGE%). Expanding..."
+        BUILD_ERRORS="COVERAGE: Only $COVERAGE_PCT% of functions lifted ($COVERAGE_FUNCS/$COVERAGE_TOTAL). Need $TARGET_COVERAGE%. Already completed files: $(ls output/src/ 2>/dev/null | tr '\n' ', ')"
+        cp "$PRD" "output/records/prd_cycle_${CYCLE}.json" 2>/dev/null
+        rm -f "$PRD"
+    fi
+fi
+
 while true; do
     CYCLE=$((CYCLE + 1))
 
@@ -622,10 +642,12 @@ while true; do
         echo "Tool:   $TOOL"
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-        if [ "$CYCLE" -eq 1 ]; then
-            PLAN_PROMPT=$(gen_plan_prompt)
-        else
+        # Use replan prompt if we have existing source (expanding coverage)
+        if [ ! -f "$PRD" ] && [ -d "output/src" ] && find output/src -name '*.zig' -o -name '*.cpp' -o -name '*.c' 2>/dev/null | grep -q .; then
+            echo "(Expanding coverage — planning next batch)"
             PLAN_PROMPT=$(gen_replan_prompt "$CYCLE" "$BUILD_ERRORS")
+        else
+            PLAN_PROMPT=$(gen_plan_prompt)
         fi
 
         echo "======================== PLAN CYCLE $CYCLE ($(date '+%Y-%m-%d %H:%M:%S')) ========================" | tee -a "$RECORD_FILE"
