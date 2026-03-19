@@ -25,25 +25,34 @@ All binaries to analyze are in `target-binaries/`. The loop script passes the sp
 
 ## Multi-Cycle Workflow
 
-The loop repeats **Plan → Build → Verify** until source compiles:
+The loop repeats **Plan → Build → Verify** until source compiles AND passes quality gates:
 
-### Phase 1: Plan
-- Cycle 1: Inspect binary, generate initial PRD (recon → analysis → reconstruction)
-- Cycle 2+: Read build errors from verify phase, generate deeper PRD targeting compilation gaps
+### Phase 0: Ghidra Pre-Analysis (once)
+- Quick: extract function boundaries + call graph → `output/ghidra/function_boundaries.tsv`, `call_graph.tsv`
+- Full: decompile all functions → `output/ghidra/all_decompiled.c`, `output/ghidra/functions/`
+- Pre-compute module chunks → `output/ghidra/module_chunks.tsv`
 
-### Phase 2: Build
-- Iterate through PRD tasks one at a time
-- Each task must produce or improve source files in `output/src/`
-- Attempt compilation after each source change
+### Phase 1: Plan (function-lifting PRD)
+- Cycle 1: Analyze Ghidra data, group functions into modules, create lifting tasks
+- Cycle 2+: Read verification errors (compilation or quality), re-plan with targeted fixes
+- Every PRD task must specify `ghidraFunctions`, `addressRange`, `targetSourceFile`
+- NO analysis-only tasks — every task must produce lifted code in `output/src/`
+
+### Phase 2: Build (lift Ghidra pseudocode → clean C/C++)
+- Read Ghidra decompiled functions from `output/ghidra/functions/`
+- Transform: `undefined8`→`uint64_t`, `FUN_*`→meaningful names, `param_N`→descriptive names
+- Preserve all control flow exactly — no invented functionality
+- Compile each module with `clang++ -c` (not `-fsyntax-only`)
 - When all PRD tasks pass → `<promise>CYCLE_DONE</promise>`
 
-### Phase 3: Verify
-- Attempt full compilation of `output/src/`
-- If compilation succeeds → **mission complete**
-- If compilation fails → archive current PRD, feed errors to re-plan, start next cycle
+### Phase 3: Verify (4 quality gates)
+1. **Source exists**: files present in `output/src/`
+2. **Quantity**: ≥500 LOC, ≥5 files
+3. **Quality**: ≥25% logic density (if/while/for/switch), ≥10 function definitions — rejects metadata-only stubs
+4. **Compilation**: `clang++ -c` succeeds (not syntax-only)
 
 ### Completion criteria
-Source code in `output/src/` compiles with `clang++`/`swiftc` targeting the original architecture. Not "all PRD tasks done" — **actual compilation success.**
+Source in `output/src/` passes ALL 4 verification gates. Not just "compiles" — must contain real lifted function implementations from Ghidra decompilation.
 
 ## Analysis Tools
 
@@ -77,7 +86,10 @@ output/
 
 ## Build Verification
 
-The reconstructed source in `output/src/` must be compilable. Each iteration that produces source code should:
-1. Attempt `clang` / `swiftc` compilation (matching the original target architecture)
-2. Log build result (success/failure + errors) in progress.txt
-3. Only mark the prd.json task as passing if compilation succeeds
+Each iteration that produces source code must:
+1. Compile with `clang++ -c` (real compilation, not `-fsyntax-only`)
+2. Log build result in progress.txt
+3. Only set `passes: true` if compilation succeeds AND output contains real function implementations
+
+The verify phase checks 4 gates: source exists → quantity thresholds → logic density → compilation.
+Metadata structs describing the binary (hardcoded strings, struct literals) are rejected by the quality gate.

@@ -56,45 +56,66 @@ RECORD_FILE="output/records/$(date '+%Y-%m-%d-%H%M%S')-decon-$TOOL.log"
 
 gen_plan_prompt() {
     cat <<PLAN_EOF
-You are an autonomous binary analysis planner. Inspect the target binary and generate a structured task plan (PRD) for full decompilation and source reconstruction.
+You are an autonomous binary decompilation planner. Your ONLY goal is to plan how to LIFT Ghidra-decompiled functions into clean, compilable C/C++ source files.
 
 ## Target
 Binary file: \`$BINARY_PATH\`
 
+## Available Ghidra data (already generated)
+- \`output/ghidra/function_boundaries.tsv\` — TSV with columns: name, entry_address, end_address, size, param_count, return_type, calling_convention, is_thunk, is_external
+- \`output/ghidra/call_graph.tsv\` — TSV with columns: caller_name, caller_address, callee_name, callee_address, ref_type
+- \`output/ghidra/all_decompiled.c\` — Full Ghidra C pseudocode for all functions
+- \`output/ghidra/functions/<prefix>/<funcname>_<addr>.c\` — Individual function decompilations
+
 ## Steps
 
-1. Run quick reconnaissance:
-   - \`file $BINARY_PATH\`
-   - \`otool -h $BINARY_PATH\` / \`otool -l $BINARY_PATH | head -200\` / \`otool -L $BINARY_PATH\`
-   - \`nm $BINARY_PATH 2>&1 | head -50\` / \`nm $BINARY_PATH 2>&1 | wc -l\`
-   - \`strings $BINARY_PATH | wc -l\` / \`strings $BINARY_PATH | head -200\`
+1. Quick recon (brief — spend most effort on Ghidra data):
+   - \`file $BINARY_PATH\` / \`otool -h $BINARY_PATH\` / \`otool -L $BINARY_PATH\`
+   - \`wc -l output/ghidra/function_boundaries.tsv\` (total function count)
 
-2. Check if Ghidra pre-analysis exists:
-   - \`output/ghidra/function_boundaries.tsv\` — all detected functions with addresses and sizes
-   - \`output/ghidra/call_graph.tsv\` — caller→callee relationships
-   If these exist, use them to inform task planning (you have real function boundaries, not just guesses).
+2. Analyze Ghidra function data to plan module chunking:
+   - Read \`output/ghidra/function_boundaries.tsv\` — count functions, identify named vs unnamed (FUN_*)
+   - Sample 10-20 decompiled functions from \`output/ghidra/functions/\` to assess pseudocode quality
+   - Read first 500 lines of \`output/ghidra/call_graph.tsv\` to understand connectivity
+   - Group functions into logical modules by:
+     (a) Address proximity (functions at adjacent addresses often belong to the same compilation unit)
+     (b) Call graph clusters (functions that call each other heavily)
+     (c) String references and import patterns
 
-3. Determine: binary type, architecture, languages, embedded frameworks, stripping level, complexity, function count from Ghidra.
+3. Create directories: \`mkdir -p output/{headers,symbols,strings,reports,src,records}\`
 
-4. Create: \`mkdir -p output/{headers,symbols,strings,classes,protocols,functions,diff,reports,obfuscation,src,records}\`
-
-5. Generate \`output/prd.json\` with schema:
+4. Generate \`output/prd.json\` with schema:
    \`\`\`json
    { "binaryTarget": "$BINARY_PATH", "binaryType": "DESC", "cycle": 1,
      "userStories": [{ "id": "US-001", "title": "...", "description": "...",
+       "ghidraFunctions": ["FUN_XXXXX", "FUN_YYYYY"],
+       "addressRange": "0x100XXXX-0x100YYYY",
+       "targetSourceFile": "output/src/module_name.cpp",
        "acceptanceCriteria": ["..."], "priority": 1, "passes": false, "notes": "" }] }
    \`\`\`
-   Rules: start structural → symbols → deps → strings → components → disassembly → source reconstruction. 5-15 tasks. Each completable in one iteration.
 
-6. Generate \`output/progress.txt\` with recon under \`## Codebase Patterns\` and empty \`## Iteration Log\`.
+   CRITICAL task planning rules:
+   - Task 1 MUST be "Create shared type definitions header" — scan Ghidra pseudocode for common types (undefined8→uint64_t, undefined4→uint32_t, etc.) and struct patterns, produce \`output/src/types.h\`
+   - Tasks 2+ are "Lift module X functions" — each task covers 20-200 related functions
+   - Each task MUST specify:
+     \`ghidraFunctions\`: list of Ghidra function names to lift
+     \`addressRange\`: address range covered
+     \`targetSourceFile\`: output .cpp/.h file path
+   - Accept criteria MUST include: "output/src/<file>.cpp contains lifted function implementations" and "compiles with clang++ -c"
+   - 10-25 tasks total, ordered by dependency (types first, then utilities, then subsystems)
 
-7. Save recon to \`output/reports/recon_summary.md\`.
+   DO NOT create analysis tasks like "extract symbols", "triage strings", "map dependencies".
+   Every task must produce actual C/C++ function implementations in output/src/.
+
+5. Generate \`output/progress.txt\` with recon summary and empty \`## Iteration Log\`.
 
 ## Rules
-- NEVER modify the target binary. All output goes inside \`output/\`.
+- NEVER modify the target binary. All output inside \`output/\`.
+- Every PRD task must produce or improve .cpp/.h files in \`output/src/\`
+- The output source must contain REAL function bodies lifted from Ghidra pseudocode, not metadata structs
 
 ## Completion
-When done, output: <promise>PLAN_COMPLETE</promise>
+When output/prd.json and output/progress.txt are created, output: <promise>PLAN_COMPLETE</promise>
 PLAN_EOF
 }
 
@@ -104,39 +125,51 @@ gen_replan_prompt() {
     local cycle_num="$1"
     local build_errors="$2"
     cat <<REPLAN_EOF
-You are an autonomous binary decompilation planner running cycle $cycle_num. The previous cycle's PRD tasks are ALL complete, but the reconstructed source does NOT compile yet.
+You are an autonomous function-lifting planner running cycle $cycle_num. The previous cycle's tasks are done but verification FAILED.
 
 ## Target
 Binary file: \`$BINARY_PATH\`
 
-## Current state
-- Read \`output/progress.txt\` for all findings so far
-- Read \`output/prd.json\` to see what was already done (all passes: true)
-- Existing source skeletons are in \`output/src/\`
-- Previous reports are in \`output/reports/\`
-- Ghidra data (if available): \`output/ghidra/function_boundaries.tsv\`, \`output/ghidra/call_graph.tsv\`, \`output/ghidra/all_decompiled.c\`
-- To get individual function decompilation, check \`output/ghidra/functions/\` or run \`./ghidra_analyze.sh $BINARY_PATH full\`
-
-## Build errors from last verification
+## Failure from last verification
 \`\`\`
 $build_errors
 \`\`\`
 
+## Diagnosing the failure
+
+If the error starts with "QUALITY:":
+→ The source files do NOT contain real lifted function implementations. They contain metadata/struct literals.
+→ You MUST: run \`rm -f output/src/*.cpp output/src/*.hpp output/src/*.h\` to delete all metadata files
+→ Then plan fresh function-lifting tasks that read Ghidra pseudocode and produce real code
+
+If the error starts with "COMPILATION:":
+→ The source has real function implementations but doesn't compile
+→ Analyze the specific compiler errors to plan targeted fixes
+
+## Current state
+- \`output/progress.txt\` — all prior findings
+- \`output/prd.json\` — previous PRD (all passes: true)
+- \`output/src/\` — current source files (may need deletion if quality failure)
+- \`output/ghidra/function_boundaries.tsv\` — all functions
+- \`output/ghidra/call_graph.tsv\` — call graph
+- \`output/ghidra/all_decompiled.c\` — full Ghidra C pseudocode
+- \`output/ghidra/functions/\` — individual function decompilations
+
 ## Your job
-1. Archive the current PRD: \`cp output/prd.json output/records/prd_cycle_$((cycle_num - 1)).json\`
-2. Analyze the build errors and existing source to determine what's missing
-3. Generate a NEW \`output/prd.json\` with:
-   - \`"cycle": $cycle_num\`
-   - Fresh tasks targeting: missing function implementations, unresolved symbols, incomplete type definitions, missing headers, incorrect control flow, etc.
-   - Each task should produce or fix actual compilable source files in \`output/src/\`
-   - Acceptance criteria MUST include "modified source compiles without the specific error this task addresses"
-   - Priority order: fix foundational types/headers first, then implementations, then linking
-4. Append cycle transition note to \`output/progress.txt\`
+1. Archive: \`cp output/prd.json output/records/prd_cycle_$((cycle_num - 1)).json\`
+2. If QUALITY failure: delete metadata source files, start fresh with function lifting
+3. If COMPILATION failure: analyze errors, plan fixes for missing types/headers/implementations
+4. Generate NEW \`output/prd.json\` with \`"cycle": $cycle_num\`:
+   - Every task MUST have \`ghidraFunctions\`, \`addressRange\`, \`targetSourceFile\`
+   - Every task MUST produce real C/C++ function implementations from Ghidra pseudocode
+   - Accept criteria MUST include "compiles with clang++ -c" and "contains N function implementations"
+   - Order: shared types.h first → utility functions → subsystem modules
+5. Append cycle transition note to \`output/progress.txt\`
 
 ## Rules
 - NEVER modify the target binary. All output inside \`output/\`.
-- Focus tasks on producing COMPILABLE source, not just analysis artifacts.
-- Every task must result in source file changes under \`output/src/\`.
+- Every task must produce LIFTED function implementations, not analysis artifacts.
+- Tasks must reference specific Ghidra function names to lift.
 
 ## Completion
 When new output/prd.json is ready, output: <promise>PLAN_COMPLETE</promise>
@@ -147,43 +180,64 @@ REPLAN_EOF
 
 gen_build_prompt() {
     cat <<BUILD_EOF
-You are an autonomous binary decompilation agent in a Ralph Loop. Your goal: produce compilable source code from the target binary.
+You are an autonomous function-lifting agent. Your job: read Ghidra decompiled C pseudocode and transform it into clean, compilable C/C++ source.
 
 ## Target
 Binary file: \`$BINARY_PATH\`
 
 ## Context — read FIRST
-1. \`output/prd.json\` — task list with completion status
-2. \`output/progress.txt\` — cumulative findings from all cycles
+1. \`output/prd.json\` — task list with \`ghidraFunctions\` and \`targetSourceFile\` per task
+2. \`output/progress.txt\` — cumulative findings
 
-## Your task
-1. Read \`output/prd.json\`, find highest-priority task where \`passes\` is \`false\`
-2. Read \`output/progress.txt\` for prior findings
-3. Execute ONLY that one task. Tools available:
-   - \`otool\`, \`nm\`, \`strings\`, \`xxd\`, \`hexdump\`, \`objdump\`, \`c++filt\`, \`swift demangle\`
-   - \`clang\`, \`clang++\`, \`swiftc\` (for compilation verification)
-   - Ghidra pre-analysis data (if available):
-     - \`output/ghidra/function_boundaries.tsv\` — all functions with name, address, size, params, return type
-     - \`output/ghidra/call_graph.tsv\` — caller→callee call graph
-     - \`output/ghidra/all_decompiled.c\` — full decompiled C pseudocode (if full mode was run)
-     - \`output/ghidra/functions/\` — individual function decompilations
-   - To run full Ghidra decompilation: \`./ghidra_analyze.sh $BINARY_PATH full\`
-4. Save analysis to \`output/{headers,symbols,strings,reports,functions}/\`
-5. Save/update reconstructed source in \`output/src/\`
-6. After writing source, attempt compilation:
-   \`\`\`
-   cd output/src && clang++ -std=c++17 -target arm64-apple-macos -fsyntax-only *.cpp *.hpp 2>&1 || true
-   \`\`\`
-   Record result in progress.txt.
-7. Update \`output/prd.json\`: set \`passes: true\` and write notes
-8. Append iteration summary to \`output/progress.txt\`
+## Workflow for each task
 
-## Rules
-- Binary at \`$BINARY_PATH\` — NEVER modify it
-- All output inside \`output/\`
+### Step 1: Identify your task
+Read \`output/prd.json\`, find the highest-priority task where \`passes\` is \`false\`.
+Note the \`ghidraFunctions\` list, \`addressRange\`, and \`targetSourceFile\`.
+
+### Step 2: Read Ghidra pseudocode
+For each function in \`ghidraFunctions\`:
+- Find it in \`output/ghidra/functions/\` (organized by address prefix subdirectories)
+- Or grep for it in \`output/ghidra/all_decompiled.c\`: \`grep -A 100 "=== FUNCNAME @" output/ghidra/all_decompiled.c\`
+- Read the raw Ghidra C pseudocode
+
+### Step 3: Clean up and lift each function
+Transform the Ghidra pseudocode into proper C/C++:
+- \`undefined8\` → \`uint64_t\`, \`undefined4\` → \`uint32_t\`, \`undefined2\` → \`uint16_t\`, \`undefined1\` → \`uint8_t\`
+- \`undefined\` → \`uint8_t\` (or appropriate type from context)
+- \`FUN_XXXXXXXXX\` → meaningful name based on what the function does (analyze string refs, call patterns, operations)
+- \`param_1\`, \`param_2\` → meaningful parameter names based on usage
+- \`uVar1\`, \`lVar2\` → meaningful local variable names
+- \`*(long *)(param_1 + 0x38)\` → keep as pointer arithmetic (or use struct if layout is known)
+- Preserve ALL control flow exactly: every if/while/for/switch/goto must match the original
+- Do NOT invent functionality — only clean up what Ghidra produced
+- Add \`#include <cstdint>\`, \`<cstring>\`, \`<cstdlib>\` as needed
+
+### Step 4: Write source files
+- Write the header: \`output/src/<module>.h\` with function declarations and type definitions
+- Write the implementation: \`output/src/<module>.cpp\` with cleaned function bodies
+- For functions that call not-yet-lifted functions, declare them as \`extern\` in the header
+- \`#include "types.h"\` if it exists (shared type definitions from task 1)
+
+### Step 5: Compile and verify
+Run: \`clang++ -std=c++17 -target arm64-apple-macos -c output/src/<module>.cpp -o /dev/null 2>&1\`
+- Do NOT use \`-fsyntax-only\` — use \`-c\` for real compilation
+- Do NOT append \`|| true\` — you need to see errors
+- If compilation fails, fix the errors before marking the task as done
+- Only set \`passes: true\` if compilation succeeds
+
+### Step 6: Update state
+- Update \`output/prd.json\`: set \`passes: true\`, record function count and notes
+- Append to \`output/progress.txt\`: what functions you lifted, key findings
+
+## CRITICAL RULES
+- You MUST read Ghidra decompiled functions as your PRIMARY input
+- Every function you write MUST correspond to a real Ghidra-decompiled function
+- Output MUST contain actual function implementations with real logic (if/while/for/switch)
+- Struct literals containing strings that describe the binary are NOT acceptable
+- Do NOT produce "analysis artifacts" or "metadata models" — produce LIFTED CODE
 - ONE task per iteration
-- Large outputs (>1000 lines) go to files
-- Source files MUST be written to \`output/src/\` and MUST attempt compilation
+- NEVER modify the target binary
 
 ## Completion
 If ALL tasks have \`passes: true\`, output exactly:
@@ -216,35 +270,78 @@ spawn_agent() {
 
 verify_build() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "Phase:  VERIFY (attempting compilation)"
+    echo "Phase:  VERIFY (compilation + quality)"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    if [ ! -d "output/src" ] || [ -z "$(find output/src -name '*.cpp' -o -name '*.c' -o -name '*.m' -o -name '*.swift' -o -name '*.zig' 2>/dev/null)" ]; then
-        echo "No source files found in output/src/"
-        BUILD_ERRORS="No source files found in output/src/. Need to generate actual compilable source."
+    # ── Gate A: source files exist ──
+    local src_files
+    src_files=$(find output/src -name '*.cpp' -o -name '*.c' -o -name '*.m' -o -name '*.swift' 2>/dev/null)
+    if [ -z "$src_files" ]; then
+        echo "FAIL: No source files in output/src/"
+        BUILD_ERRORS="No source files found in output/src/. Must lift Ghidra functions into compilable source."
         return 1
     fi
 
-    # Try compilation based on what's there
-    local errors=""
+    # ── Gate B: source quantity thresholds ──
+    local file_count loc
+    file_count=$(echo "$src_files" | wc -l | tr -d ' ')
+    loc=$(echo "$src_files" | xargs wc -l 2>/dev/null | tail -1 | awk '{print $1}')
+    echo "Source: $file_count files, $loc LOC"
+
+    if [ "$loc" -lt 500 ]; then
+        echo "FAIL: Only $loc LOC (need ≥500). Source is too small for a real reconstruction."
+        BUILD_ERRORS="QUALITY: Only $loc lines of code across $file_count files. Minimum 500 LOC required. Lift more Ghidra functions into output/src/."
+        return 1
+    fi
+
+    # ── Gate C: source quality — must contain real function logic, not just data structs ──
+    local logic_lines data_lines
+    logic_lines=$(grep -cE '(if\s*\(|while\s*\(|for\s*\(|switch\s*\(|->|<<|>>|\+\+|--|&&|\|\|)' output/src/*.cpp output/src/*.c 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}')
+    data_lines=$(grep -cE '^\s*"[^"]*"|\{\s*"|\{\s*[0-9]' output/src/*.cpp output/src/*.c 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}')
+
+    local total_content=$((logic_lines + data_lines))
+    if [ "$total_content" -gt 0 ]; then
+        local logic_ratio=$((logic_lines * 100 / total_content))
+        echo "Logic density: ${logic_ratio}% ($logic_lines logic lines / $total_content content lines)"
+        if [ "$logic_ratio" -lt 25 ]; then
+            echo "FAIL: Source is ${logic_ratio}% logic (need ≥25%). Files contain mostly data literals, not lifted function implementations."
+            BUILD_ERRORS="QUALITY: Source is only ${logic_ratio}% logic (${logic_lines} logic lines vs ${data_lines} data lines). Files appear to be metadata/struct literals, not real function implementations lifted from Ghidra decompilation. Delete metadata-only files and produce actual C/C++ function implementations from output/ghidra/functions/."
+            return 1
+        fi
+    fi
+
+    local func_defs
+    func_defs=$(grep -cE '^[a-zA-Z_].*\(.*\)\s*\{' output/src/*.cpp output/src/*.c 2>/dev/null | awk -F: '{s+=$NF}END{print s+0}')
+    echo "Function definitions: $func_defs"
+    if [ "$func_defs" -lt 10 ]; then
+        echo "FAIL: Only $func_defs function definitions (need ≥10)."
+        BUILD_ERRORS="QUALITY: Only $func_defs function definitions found. Need at least 10 real function implementations lifted from the binary."
+        return 1
+    fi
+
+    # ── Gate D: actual compilation (not just syntax check) ──
+    local errors="" compile_rc=0
     if find output/src -name 'CMakeLists.txt' | grep -q .; then
-        errors=$(cd output/src && cmake -B /tmp/decon-build -DCMAKE_OSX_ARCHITECTURES=arm64 . 2>&1 && cmake --build /tmp/decon-build 2>&1) || true
+        errors=$(cd output/src && cmake -B /tmp/decon-build -DCMAKE_OSX_ARCHITECTURES=arm64 . 2>&1 && cmake --build /tmp/decon-build 2>&1)
+        compile_rc=$?
     elif find output/src -name '*.cpp' -o -name '*.c' | grep -q .; then
-        errors=$(find output/src -name '*.cpp' -o -name '*.c' | head -20 | xargs clang++ -std=c++17 -target arm64-apple-macos -fsyntax-only 2>&1) || true
+        errors=$(find output/src -name '*.cpp' -o -name '*.c' | xargs clang++ -std=c++17 -target arm64-apple-macos -c -o /dev/null 2>&1)
+        compile_rc=$?
     elif find output/src -name '*.swift' | grep -q .; then
-        errors=$(find output/src -name '*.swift' | head -20 | xargs swiftc -typecheck -target arm64-apple-macos 2>&1) || true
+        errors=$(find output/src -name '*.swift' | xargs swiftc -typecheck -target arm64-apple-macos 2>&1)
+        compile_rc=$?
     fi
 
-    if [ $? -eq 0 ] && [ -z "$errors" ]; then
-        echo "Compilation succeeded!"
-        BUILD_ERRORS=""
-        return 0
-    else
-        echo "Compilation failed."
+    if [ "$compile_rc" -ne 0 ] || [ -n "$errors" ]; then
+        echo "FAIL: Compilation errors."
         echo "$errors" | head -50
-        BUILD_ERRORS="$errors"
+        BUILD_ERRORS="COMPILATION:\n$errors"
         return 1
     fi
+
+    echo "ALL GATES PASSED: $file_count files, $loc LOC, ${logic_ratio:-0}% logic, $func_defs functions, compiles clean."
+    BUILD_ERRORS=""
+    return 0
 }
 
 # ─── Phase 0: Ghidra pre-analysis (run once) ────────────────────────────────
@@ -288,6 +385,42 @@ if [ ! -f "output/ghidra/all_decompiled.c" ]; then
 else
     DECOMP_SIZE=$(du -sh output/ghidra/all_decompiled.c | cut -f1)
     echo "[2/2] Full decompilation cached ($DECOMP_SIZE). Skipping."
+fi
+
+# ─── Pre-compute module chunks for planning ─────────────────────────────────
+
+if [ -f "output/ghidra/function_boundaries.tsv" ] && [ ! -f "output/ghidra/module_chunks.tsv" ]; then
+    echo "Pre-computing module chunks from function boundaries..."
+    python3 -c "
+import csv, sys
+from collections import defaultdict
+
+chunks = defaultdict(lambda: {'count': 0, 'min_addr': '', 'max_addr': '', 'named': 0, 'total_size': 0})
+with open('output/ghidra/function_boundaries.tsv') as f:
+    reader = csv.DictReader(f, delimiter='\t')
+    for row in reader:
+        addr = row['entry_address']
+        prefix = addr[:6] if len(addr) > 6 else addr
+        c = chunks[prefix]
+        c['count'] += 1
+        c['total_size'] += int(row['size'])
+        if not row['name'].startswith('FUN_') and not row['name'].startswith('thunk_'):
+            c['named'] += 1
+        if not c['min_addr'] or addr < c['min_addr']:
+            c['min_addr'] = addr
+        if not c['max_addr'] or addr > c['max_addr']:
+            c['max_addr'] = addr
+
+with open('output/ghidra/module_chunks.tsv', 'w') as out:
+    out.write('prefix\tfunction_count\tnamed_count\ttotal_bytes\tmin_address\tmax_address\n')
+    for prefix in sorted(chunks.keys()):
+        c = chunks[prefix]
+        out.write(f\"{prefix}\t{c['count']}\t{c['named']}\t{c['total_size']}\t{c['min_addr']}\t{c['max_addr']}\n\")
+" 2>/dev/null
+    if [ -f "output/ghidra/module_chunks.tsv" ]; then
+        CHUNK_COUNT=$(tail -n +2 output/ghidra/module_chunks.tsv | wc -l | tr -d ' ')
+        echo "Module chunks: $CHUNK_COUNT address-prefix groups."
+    fi
 fi
 
 echo ""
