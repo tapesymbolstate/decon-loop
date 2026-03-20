@@ -1215,10 +1215,12 @@ Each chunk file is named like \`chunk_NNN_LSTART-LEND.js\`.
 2. Resolve the chunk files from its \`chunkRange\` (see above)
 3. Read the chunk files for this task (cat or read each one)
 4. Rewrite the code into a clean JavaScript module:
-   - Rename ALL single-letter and mangled identifiers to meaningful names
-   - Use string literals, error messages, property names, and API URLs as clues
+   - Rename ALL mangled identifiers (variables, functions, parameters, class names) at their DECLARATION site
+   - Every reference to a renamed symbol must also be updated — if you rename \`kFT\` to \`treeifyError\` in its declaration, every usage of \`kFT\` in the file must become \`treeifyError\`
+   - Do NOT leave any mangled names as values in export objects or property assignments — the value side must match the renamed declaration
+   - Use string literals, error messages, property names, API URLs, and call-site context as clues for naming
    - Replace \`!0\` with \`true\`, \`!1\` with \`false\`, \`void 0\` with \`undefined\`
-   - Add brief comments for non-obvious logic
+   - Add brief comments only for non-obvious logic
    - Preserve all logic exactly — do NOT change behavior
    - Output valid JavaScript (ES module style where applicable)
 5. Write to the task's \`targetSourceFile\` path (\`mkdir -p output/src\` first)
