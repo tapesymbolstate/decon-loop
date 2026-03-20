@@ -1,11 +1,12 @@
 #!/bin/bash
 # Decon Agent — Binary Decompilation via Ralph Loop
 #
-# Usage: ./loop_decon.sh <binary_path> [codex|claude] [max_iterations]
+# Usage: ./loop_decon.sh <binary_path> [codex|codex-spark|claude] [max_iterations]
 #
 # Examples:
-#   ./loop_decon.sh target-binaries/sample-binary              # Claude, unlimited
-#   ./loop_decon.sh target-binaries/sample-binary codex 50     # Codex, max 50
+#   ./loop_decon.sh target-binaries/sample-binary                    # Claude, unlimited
+#   ./loop_decon.sh target-binaries/sample-binary codex 50           # Codex gpt-5.4, max 50
+#   ./loop_decon.sh target-binaries/sample-binary codex-spark        # Codex Spark (fast), unlimited
 #
 # Multi-cycle workflow:
 #   1. Plan   → auto-generate PRD from binary recon (or existing findings)
@@ -35,7 +36,7 @@ if [ ! -f "$BINARY_PATH" ]; then
 fi
 
 TOOL="claude"
-if [ "${1:-}" = "codex" ] || [ "${1:-}" = "claude" ]; then
+if [ "${1:-}" = "codex" ] || [ "${1:-}" = "codex-spark" ] || [ "${1:-}" = "claude" ]; then
     TOOL="$1"
     shift
 fi
@@ -698,10 +699,12 @@ COMPOSITION_PY
 
 spawn_agent() {
     local prompt="$1"
-    if [ "$TOOL" = "codex" ]; then
+    if [ "$TOOL" = "codex" ] || [ "$TOOL" = "codex-spark" ]; then
+        local model="${CODEX_MODEL:-gpt-5.4}"
+        [ "$TOOL" = "codex-spark" ] && model="gpt-5.3-codex-spark"
         echo "$prompt" | codex exec \
             --full-auto \
-            --model "${CODEX_MODEL:-gpt-5.4}" \
+            --model "$model" \
             2>&1 || true
     else
         claude -p \
@@ -859,7 +862,326 @@ verify_build() {
     return 0
 }
 
-# ─── Phase 0: Ghidra pre-analysis (run once) ────────────────────────────────
+# ─── Phase -1: Detect bun build --compile binaries ───────────────────────────
+
+IS_BUN_COMPILED=false
+
+echo "╔══════════════════════════════════════════════════════════════╗"
+echo "║  BINARY FORMAT DETECTION                                    ║"
+echo "╚══════════════════════════════════════════════════════════════╝"
+echo ""
+
+if otool -l "$BINARY_PATH" 2>/dev/null | grep -q "__BUN"; then
+    IS_BUN_COMPILED=true
+    echo ">>> Detected: bun build --compile artifact (found __BUN segment)"
+    echo ""
+
+    mkdir -p output/bundled_app output/src
+
+    if [ ! -f "output/bundled_app/app_bundle.js" ]; then
+        echo "Extracting embedded application code from __BUN section..."
+
+        BINARY_PATH="$BINARY_PATH" python3 <<'BUN_EXTRACT_PY'
+import struct, re, os, json
+
+binary = os.environ.get("BINARY_PATH", "")
+if not binary:
+    import sys; sys.exit("BINARY_PATH not set")
+
+# Parse Mach-O to find __BUN segment
+with open(binary, 'rb') as f:
+    magic = struct.unpack('<I', f.read(4))[0]
+    if magic == 0xFEEDFACF:  # 64-bit Mach-O
+        f.seek(0)
+        header = f.read(32)
+        _, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, reserved = struct.unpack('<IIIIIIII', header)
+
+        offset = 32
+        bun_offset = None
+        bun_size = None
+        for _ in range(ncmds):
+            f.seek(offset)
+            cmd, cmdsize = struct.unpack('<II', f.read(8))
+
+            if cmd == 0x19:  # LC_SEGMENT_64
+                f.seek(offset + 8)
+                segname = f.read(16).split(b'\x00')[0].decode('ascii', errors='replace')
+                if segname == '__BUN':
+                    f.seek(offset + 48)
+                    bun_offset = struct.unpack('<Q', f.read(8))[0]
+                    bun_size = struct.unpack('<Q', f.read(8))[0]
+                    break
+            offset += cmdsize
+
+        if bun_offset and bun_size:
+            f.seek(bun_offset)
+            data = f.read(bun_size)
+
+            # Decode and extract readable JS
+            text = data.decode('utf-8', errors='replace')
+
+            # Find contiguous readable segments
+            segments = []
+            current = []
+            for i, ch in enumerate(text):
+                if ch.isprintable() or ch in '\n\r\t':
+                    current.append(ch)
+                else:
+                    if len(current) > 200:
+                        segments.append(''.join(current))
+                    current = []
+            if len(current) > 200:
+                segments.append(''.join(current))
+
+            # Separate app code from Bun builtins
+            app_segments = []
+            builtin_segments = []
+            for seg in segments:
+                if '@getInternalField' in seg or '@createInternalModuleById' in seg:
+                    builtin_segments.append(seg)
+                else:
+                    app_segments.append(seg)
+
+            # Save app bundle
+            with open('output/bundled_app/app_bundle.js', 'w') as out:
+                for seg in app_segments:
+                    out.write(seg + '\n')
+
+            # Save builtins separately
+            with open('output/bundled_app/bun_builtins.js', 'w') as out:
+                for seg in builtin_segments:
+                    out.write(seg + '\n')
+
+            # Detect app identity
+            all_app = '\n'.join(app_segments[:5])
+            app_info = {'format': 'bun_compiled', 'bun_section_size': bun_size}
+
+            # Look for version, name, copyright
+            ver_match = re.search(r'Version:\s*([0-9]+\.[0-9]+\.[0-9]+)', all_app)
+            if ver_match:
+                app_info['app_version'] = ver_match.group(1)
+            copy_match = re.search(r'\(c\)\s*(.+?)\.', all_app)
+            if copy_match:
+                app_info['copyright'] = copy_match.group(1).strip()
+            name_match = re.search(r'//\s*(\w[\w\s]+)\s*is a', all_app)
+            if name_match:
+                app_info['app_name'] = name_match.group(1).strip()
+
+            with open('output/bundled_app/app_info.json', 'w') as out:
+                json.dump(app_info, out, indent=2)
+
+            app_chars = sum(len(s) for s in app_segments)
+            builtin_chars = sum(len(s) for s in builtin_segments)
+            print(f"  App code:     {app_chars:,} chars ({len(app_segments)} segments)")
+            print(f"  Bun builtins: {builtin_chars:,} chars ({len(builtin_segments)} segments)")
+            print(f"  Saved to:     output/bundled_app/")
+
+            if 'app_name' in app_info:
+                print(f"  App name:     {app_info['app_name']}")
+            if 'app_version' in app_info:
+                print(f"  App version:  {app_info['app_version']}")
+        else:
+            print("  Warning: __BUN segment found but could not parse offset/size")
+    else:
+        print("  Warning: Not a 64-bit Mach-O, skipping __BUN extraction")
+BUN_EXTRACT_PY
+
+    else
+        echo "App bundle already extracted. Skipping."
+        cat output/bundled_app/app_info.json 2>/dev/null | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print(f'  App: {d.get(\"app_name\",\"unknown\")} v{d.get(\"app_version\",\"?\")}')
+print(f'  __BUN size: {d.get(\"bun_section_size\",0):,} bytes')
+" 2>/dev/null
+    fi
+
+    echo ""
+
+    # ─── Phase A: Auto-beautify with js-beautify ─────────────────────────────
+    if [ -f "output/bundled_app/app_bundle.js" ] && [ ! -f "output/bundled_app/app_beautified.js" ]; then
+        echo "╔══════════════════════════════════════════════════════════════╗"
+        echo "║  PHASE A: AUTO-BEAUTIFY (js-beautify)                      ║"
+        echo "╚══════════════════════════════════════════════════════════════╝"
+        echo ""
+        echo "Formatting minified JS with js-beautify..."
+        npx js-beautify \
+            --type js \
+            --indent-size 2 \
+            --space-in-paren \
+            --brace-style collapse,preserve-inline \
+            --wrap-line-length 120 \
+            -f output/bundled_app/app_bundle.js \
+            -o output/bundled_app/app_beautified.js 2>&1 | tail -3
+        if [ -f "output/bundled_app/app_beautified.js" ]; then
+            BEFORE=$(wc -c < output/bundled_app/app_bundle.js | tr -d ' ')
+            AFTER_LINES=$(wc -l < output/bundled_app/app_beautified.js | tr -d ' ')
+            echo "  Beautified: $AFTER_LINES lines (from $(echo "$BEFORE" | awk '{printf "%\047d", $1}') chars minified)"
+        else
+            echo "  Warning: js-beautify failed, falling back to raw bundle"
+            cp output/bundled_app/app_bundle.js output/bundled_app/app_beautified.js
+        fi
+        echo ""
+    fi
+
+    # ─── Phase B: Chunk into logical segments ────────────────────────────────
+    if [ -f "output/bundled_app/app_beautified.js" ] && [ ! -d "output/bundled_app/chunks" ]; then
+        echo "╔══════════════════════════════════════════════════════════════╗"
+        echo "║  PHASE B: CHUNKING (split into ~500-line segments)           ║"
+        echo "╚══════════════════════════════════════════════════════════════╝"
+        echo ""
+
+        python3 <<'CHUNK_PY'
+import re, os, json
+
+infile = "output/bundled_app/app_beautified.js"
+outdir = "output/bundled_app/chunks"
+os.makedirs(outdir, exist_ok=True)
+
+with open(infile) as f:
+    lines = f.readlines()
+
+total = len(lines)
+TARGET_CHUNK = 500  # lines per chunk
+
+# Find natural break points (top-level function/class/var declarations)
+break_pattern = re.compile(r'^(function |class |var |const |let |async function |export |\(function\()')
+
+breakpoints = [0]
+for i, line in enumerate(lines):
+    if i > 0 and break_pattern.match(line.lstrip()):
+        # Only break if we're at roughly the target size
+        if i - breakpoints[-1] >= TARGET_CHUNK * 0.7:
+            breakpoints.append(i)
+
+breakpoints.append(total)
+
+# Write chunks
+chunks_meta = []
+for idx in range(len(breakpoints) - 1):
+    start = breakpoints[idx]
+    end = breakpoints[idx + 1]
+    chunk_lines = lines[start:end]
+
+    # Skip near-empty chunks
+    content = ''.join(chunk_lines).strip()
+    if len(content) < 100:
+        continue
+
+    chunk_name = f"chunk_{idx:03d}_L{start+1}-L{end}.js"
+    with open(f"{outdir}/{chunk_name}", 'w') as f:
+        f.write(f"// Chunk {idx}: lines {start+1}-{end} of app_beautified.js\n")
+        f.writelines(chunk_lines)
+
+    # Extract hints for the AI (string literals, error messages, API URLs)
+    strings = re.findall(r'"([^"]{10,80})"', content)
+    errors = [s for s in strings if 'error' in s.lower() or 'fail' in s.lower() or 'invalid' in s.lower()]
+    urls = [s for s in strings if '/' in s and ('http' in s or 'api' in s or 'oauth' in s)]
+    keywords = [s for s in strings if any(k in s.lower() for k in ['claude', 'anthropic', 'mcp', 'tool', 'permission', 'session', 'message'])]
+
+    chunks_meta.append({
+        'file': chunk_name,
+        'start_line': start + 1,
+        'end_line': end,
+        'lines': end - start,
+        'chars': len(content),
+        'hint_errors': errors[:5],
+        'hint_urls': urls[:5],
+        'hint_keywords': keywords[:5],
+    })
+
+# Write chunk index
+with open(f"{outdir}/index.json", 'w') as f:
+    json.dump({'total_lines': total, 'chunks': chunks_meta}, f, indent=2)
+
+print(f"  Total lines: {total:,}")
+print(f"  Chunks: {len(chunks_meta)}")
+print(f"  Avg chunk: {total // max(len(chunks_meta),1)} lines")
+for c in chunks_meta[:5]:
+    hints = c['hint_keywords'][:2] or c['hint_errors'][:2] or c['hint_urls'][:1]
+    hint_str = ', '.join(hints[:2]) if hints else '(no hints)'
+    print(f"    {c['file']}: {c['lines']} lines — {hint_str}")
+if len(chunks_meta) > 5:
+    print(f"    ... +{len(chunks_meta)-5} more chunks")
+CHUNK_PY
+        echo ""
+    fi
+
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║  MODE: BUN COMPILED APP — skipping Ghidra, extracting JS     ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "The application logic is embedded JavaScript, not native code."
+    echo "Ghidra decompilation is not needed for app logic extraction."
+    echo ""
+
+    # Generate a PRD for the AI agent to analyze the extracted JS
+    ANALYSIS_MODE="bun_compiled_app"
+
+    gen_bun_app_plan_prompt() {
+        cat <<BUN_PLAN_EOF
+You are a source code analyst. A \`bun build --compile\` binary has been extracted.
+
+## Data
+- \`output/bundled_app/app_info.json\` — app metadata
+- \`output/bundled_app/chunks/\` — beautified JS code split into ~400-line chunks
+
+## Job
+1. Read \`output/bundled_app/app_info.json\`
+2. Run \`ls output/bundled_app/chunks/ | wc -l\` to see how many chunks exist
+3. Sample chunks at intervals (chunk_000, chunk_050, chunk_100, chunk_200, chunk_400, chunk_600) — read first 30 lines of each
+4. Group chunks into 15-25 modules by purpose, create \`output/prd.json\`:
+   \`\`\`json
+   { "binaryTarget": "$BINARY_PATH", "analysisMode": "bun_compiled_app", "cycle": 1,
+     "userStories": [{ "id": "US-001", "title": "Module name",
+       "chunkFiles": ["output/bundled_app/chunks/chunk_NNN_*.js"],
+       "targetSourceFile": "output/src/module_name.js",
+       "priority": 1, "passes": false }] }
+   \`\`\`
+5. Write \`output/progress.txt\` with app overview
+
+Keep PRD under 30KB. 15-25 tasks max. Group adjacent chunks into modules.
+
+When done: <promise>PLAN_COMPLETE</promise>
+BUN_PLAN_EOF
+    }
+
+    gen_bun_app_build_prompt() {
+        cat <<BUN_BUILD_EOF
+You are a JavaScript deobfuscator. Read a chunk of beautified-but-mangled JS and rewrite it with meaningful names.
+
+## Context
+1. \`output/prd.json\` — task list
+2. \`output/progress.txt\` — previous findings and name mappings
+
+## Job
+1. Pick the first task in \`output/prd.json\` where \`passes\` is \`false\`
+2. Read its \`chunkFiles\`
+3. Rewrite the code:
+   - Rename ALL single-letter and mangled identifiers to meaningful names
+   - Use string literals, error messages, property names, and API URLs as clues
+   - Replace \`!0\` with \`true\`, \`!1\` with \`false\`, \`void 0\` with \`undefined\`
+   - Add brief comments for non-obvious logic
+   - Preserve all logic exactly
+4. Write to the \`targetSourceFile\` path (mkdir -p first)
+5. Append name mappings to \`output/progress.txt\`
+6. Set \`passes: true\` in \`output/prd.json\`
+
+ONE task per iteration. When all done: <promise>CYCLE_DONE</promise>
+BUN_BUILD_EOF
+    }
+
+    # Skip straight to main loop with bun_compiled_app mode
+    # (Ghidra, discovery, mapping, composition all skipped)
+
+else
+    echo ">>> Standard binary (no __BUN segment). Proceeding with Ghidra pipeline."
+    echo ""
+fi
+
+# ─── Phase 0: Ghidra pre-analysis (run once, skip if bun compiled app) ────────
+
+if [ "$IS_BUN_COMPILED" = false ]; then
 
 mkdir -p /tmp/ghidra-projects output/ghidra
 
@@ -1000,9 +1322,11 @@ import json
 d = json.load(open('output/composition/analysis.json'))
 c = d['categories']
 print(f\"Framework:        {c['framework']['count']:,} ({c['framework']['pct']}%)\")
-print(f\"Third-party:      {c['third_party']['count']:,} ({c['third_party']['pct']}%)\")
+fp = c.get('framework_propagated', c.get('third_party', {}))
+print(f\"Propagated:       {fp.get('count',0):,} ({fp.get('pct',0)}%)\")
 print(f\"Compiler/system:  {c['compiler_system']['count']:,} ({c['compiler_system']['pct']}%)\")
-print(f\"Custom/unknown:   {c['custom_unknown']['count']:,} ({c['custom_unknown']['pct']}%)\")
+unk = c.get('unknown', c.get('custom_unknown', {}))
+print(f\"Unknown:          {unk.get('count',0):,} ({unk.get('pct',0)}%)\")
 print(f\"Recommended mode: {d['mode']}\")
 " 2>/dev/null
     fi
@@ -1021,6 +1345,8 @@ print(f\"Recommended mode: {d['mode']}\")
 
     echo ""
 fi
+
+fi  # end IS_BUN_COMPILED=false (Ghidra + discovery + mapping + composition)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN LOOP: Plan → Build → Verify → Re-plan if needed
@@ -1064,7 +1390,10 @@ while true; do
         echo "Mode:   $ANALYSIS_MODE"
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-        if [ "$ANALYSIS_MODE" = "custom_extraction" ]; then
+        if [ "$ANALYSIS_MODE" = "bun_compiled_app" ]; then
+            echo "(Bun compiled app — extracting and de-minifying JS application code)"
+            PLAN_PROMPT=$(gen_bun_app_plan_prompt)
+        elif [ "$ANALYSIS_MODE" = "custom_extraction" ]; then
             echo "(Custom extraction mode — focusing on unique application logic)"
             PLAN_PROMPT=$(gen_custom_plan_prompt "$CYCLE" "$BUILD_ERRORS")
         elif [ ! -f "$PRD" ] && [ -d "output/src" ] && find output/src -name '*.zig' -o -name '*.cpp' -o -name '*.c' 2>/dev/null | grep -q .; then
@@ -1101,7 +1430,9 @@ while true; do
     [ "$MAX_ITERATIONS" -gt 0 ] && echo "Max:    $MAX_ITERATIONS total iterations"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    if [ "$ANALYSIS_MODE" = "custom_extraction" ]; then
+    if [ "$ANALYSIS_MODE" = "bun_compiled_app" ]; then
+        BUILD_PROMPT=$(gen_bun_app_build_prompt)
+    elif [ "$ANALYSIS_MODE" = "custom_extraction" ]; then
         BUILD_PROMPT=$(gen_custom_build_prompt)
     else
         BUILD_PROMPT=$(gen_build_prompt)

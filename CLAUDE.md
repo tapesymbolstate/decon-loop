@@ -10,6 +10,16 @@ Fully reconstruct buildable source code from target binaries using the Ralph Loo
 
 The end goal is a complete, readable, buildable codebase — not just analysis artifacts.
 
+## Design Principle: GENERIC TOOL, NOT TARGET-SPECIFIC
+
+This project builds a **universal binary decompilation pipeline** — it must work on ANY binary, not just the current test target. All prompts, scripts, detection logic, and extraction code must be:
+
+- **Target-agnostic** — no hardcoded variable names, function signatures, or string patterns from a specific binary
+- **Format-generic** — handle Mach-O, ELF, PE; native binaries and bundled-app binaries (bun, pkg, nexe, etc.)
+- **Prompt-generic** — never include app-specific examples (like OAuth URLs or function names from a particular app) in prompts sent to AI agents
+
+If you find yourself writing code that only works for one specific binary, STOP and make it generic.
+
 ## Critical Constraints
 
 - NEVER modify original binaries in `target-binaries/`
