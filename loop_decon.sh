@@ -1231,6 +1231,66 @@ ONE task per iteration. When ALL tasks have \`passes: true\`, output: <promise>C
 BUN_BUILD_EOF
     }
 
+    gen_restructure_prompt() {
+        cat <<'RESTRUCTURE_EOF'
+You are a JavaScript project architect. Read deobfuscated flat modules and rewrite them into a clean, human-manageable project.
+
+## Input (READ-ONLY — do NOT modify these)
+- `output/src/*.js` — flat deobfuscated modules (some are 2000-4000+ LOC)
+- `output/progress.txt` — name mappings and subsystem notes
+
+## Output directory
+- `output/src-structured/` — write ALL output here (`mkdir -p` first)
+- NEVER modify anything in `output/src/`
+
+## Goal
+Produce a project structure that a working engineer could realistically maintain. Think "what would a senior dev expect if they inherited this codebase?" — clear module boundaries, files organized by domain, and each file small enough to reason about without scrolling endlessly. Use your judgment on granularity; the bar is practical maintainability, not a strict LOC target.
+
+## Job
+
+### Phase 1: Analyze ONE source file
+1. Read the first source file from `output/src/` that has NOT yet been processed
+   - Check `output/restructure_progress.json` to see which files are done (create it if missing)
+2. Identify every distinct responsibility/concern in that file
+3. Plan how to split it into 200-500 LOC modules
+
+### Phase 2: Split and write
+1. For each identified concern, write a focused module to the appropriate domain directory under `output/src-structured/`
+2. Each output file must:
+   - Have a clear, descriptive filename (kebab-case)
+   - Contain only ONE logical concern
+   - Be 200-500 LOC (hard max 800)
+   - Have correct relative imports to other files already in `output/src-structured/`
+3. Run `node --check` on every file you write
+
+### Phase 3: Track progress
+Update `output/restructure_progress.json`:
+```json
+{
+  "completed": ["bootstrap_docs_telemetry_models.js", ...],
+  "remaining": ["anthropic_client_commands_sandbox.js", ...],
+  "outputFiles": 42,
+  "totalLOC": 49226
+}
+```
+
+### Domain directories to use (create as needed)
+`core/`, `api/`, `auth/`, `cli/`, `mcp/`, `tools/`, `ui/`, `plugins/`, `providers/`, `security/`, `telemetry/`, `remote/`, `validation/`, `parsers/`, `sessions/`
+
+### Rules
+- NEVER modify `output/src/`
+- ONE source file per iteration — do NOT try to process all 25 at once
+- Split by responsibility: keep related classes and functions together if they share state or form a cohesive unit
+- Preserve ALL exports — every export from the source must appear in some output file
+- Use relative imports between output files
+- Do NOT create barrel/index.js files — direct imports only
+- If you see `import ... from "./some_file.js"` in the source, resolve it to the correct path in `output/src-structured/`
+
+Process ONE source file, then output <promise>RESTRUCTURE_PROGRESS</promise>
+When ALL files are done, output <promise>RESTRUCTURE_DONE</promise>
+RESTRUCTURE_EOF
+    }
+
     # Skip straight to main loop with bun_compiled_app mode
     # (Ghidra, discovery, mapping, composition all skipped)
 
@@ -1420,7 +1480,43 @@ if [ -f "$PLAN" ] && ! python3 -c "import json,sys; d=json.load(open('$PLAN')); 
     if verify_build; then
         measure_coverage
         if [ "$COVERAGE_PCT" -ge "$TARGET_COVERAGE" ]; then
-            echo "Coverage target already met ($COVERAGE_PCT%). Nothing to do."
+            echo "Coverage target already met ($COVERAGE_PCT%)."
+
+            # ── RESTRUCTURE phase (resume path) ───────────────────────────
+            if [ "$ANALYSIS_MODE" = "bun_compiled_app" ] && type gen_restructure_prompt &>/dev/null; then
+                echo ""
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo "Phase:  RESTRUCTURE"
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo ""
+
+                RESTRUCTURE_PROMPT=$(gen_restructure_prompt)
+                RECORD_FILE="output/records/$(date '+%Y-%m-%d-%H%M%S')-restructure-$TOOL.log"
+                RSTEP=0
+
+                while true; do
+                    RSTEP=$((RSTEP + 1))
+                    echo "======================== RESTRUCTURE step $RSTEP ($(date '+%Y-%m-%d %H:%M:%S')) ========================" | tee -a "$RECORD_FILE"
+                    RESULT=$(spawn_agent "$RESTRUCTURE_PROMPT" 2>&1)
+                    echo "$RESULT" | tee -a "$RECORD_FILE"
+
+                    if echo "$RESULT" | grep -q "RESTRUCTURE_DONE"; then
+                        echo ""
+                        echo "╔══════════════════════════════════════════════════════════════╗"
+                        echo "║  RESTRUCTURE COMPLETE — Project organized!                 ║"
+                        echo "╚══════════════════════════════════════════════════════════════╝"
+                        break
+                    elif echo "$RESULT" | grep -q "RESTRUCTURE_PROGRESS"; then
+                        echo "... step $RSTEP done, continuing..."
+                        continue
+                    else
+                        echo ""
+                        echo "⚠ Restructure step $RSTEP did not signal progress. Retrying..."
+                        continue
+                    fi
+                done
+            fi
+
             exit 0
         fi
         echo "Coverage: $COVERAGE_PCT% (target: $TARGET_COVERAGE%). Expanding..."
@@ -1562,11 +1658,46 @@ if changed:
         if [ "$COVERAGE_PCT" -ge "$TARGET_COVERAGE" ]; then
             echo ""
             echo "╔══════════════════════════════════════════════════════════════╗"
-            echo "║  SUCCESS — Coverage target reached! Mission complete.       ║"
+            echo "║  SUCCESS — Coverage target reached!                        ║"
             echo "╠══════════════════════════════════════════════════════════════╣"
             echo "║  Functions: $COVERAGE_FUNCS/$COVERAGE_TOTAL ($COVERAGE_PCT%)"
             echo "║  Source:    $COVERAGE_FILES files, $COVERAGE_LOC LOC"
             echo "╚══════════════════════════════════════════════════════════════╝"
+            echo ""
+
+            # ── RESTRUCTURE phase ──────────────────────────────────────────
+            if [ "$ANALYSIS_MODE" = "bun_compiled_app" ] && type gen_restructure_prompt &>/dev/null; then
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo "Phase:  RESTRUCTURE"
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo ""
+
+                RESTRUCTURE_PROMPT=$(gen_restructure_prompt)
+                RSTEP=0
+
+                while true; do
+                    RSTEP=$((RSTEP + 1))
+                    echo "======================== RESTRUCTURE step $RSTEP ($(date '+%Y-%m-%d %H:%M:%S')) ========================" | tee -a "$RECORD_FILE"
+                    RESULT=$(spawn_agent "$RESTRUCTURE_PROMPT" 2>&1)
+                    echo "$RESULT" | tee -a "$RECORD_FILE"
+
+                    if echo "$RESULT" | grep -q "RESTRUCTURE_DONE"; then
+                        echo ""
+                        echo "╔══════════════════════════════════════════════════════════════╗"
+                        echo "║  RESTRUCTURE COMPLETE — Project organized!                 ║"
+                        echo "╚══════════════════════════════════════════════════════════════╝"
+                        break
+                    elif echo "$RESULT" | grep -q "RESTRUCTURE_PROGRESS"; then
+                        echo "... step $RSTEP done, continuing..."
+                        continue
+                    else
+                        echo ""
+                        echo "⚠ Restructure step $RSTEP did not signal progress. Retrying..."
+                        continue
+                    fi
+                done
+            fi
+
             echo ""
             echo "Record saved: $RECORD_FILE"
             exit 0
