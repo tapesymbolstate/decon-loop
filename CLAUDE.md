@@ -46,17 +46,38 @@ The harness automatically tries to identify the binary and find its source:
 
 If discovery fails (closed-source binary), the pipeline falls back to pure Ghidra lifting.
 
+### Phase 0.75: Composition Analysis (automatic, when mapping exists)
+When source mapping is available (>10% of functions mapped), the pipeline automatically:
+1. Categorizes ALL functions: framework (mapped), third-party libraries (by name patterns + call-graph propagation), compiler/system, custom/unknown
+2. Identifies bundled third-party libraries (boringssl, zlib, mimalloc, libuv, sqlite, etc.)
+3. Outputs `output/composition/analysis.json` with breakdown
+4. Auto-selects mode:
+   - **`custom_extraction`**: Framework covers >10% → skip known code, focus on custom logic
+   - **`full_reconstruction`**: Low mapping → reconstruct everything from Ghidra
+
 ### Phase 1: Plan
+**Full reconstruction mode** (default):
 - If mapping exists: group tasks by SOURCE FILE, prioritize high-confidence mappings
 - If no mapping: group by address proximity + call graph clusters
 - Every task: `ghidraFunctions`, `addressRange`, `targetSourceFile`, optionally `sourceFiles`
 - Output file extension matches source language (.zig, .cpp, .c, .rs)
 
+**Custom extraction mode** (auto-selected):
+- Skip framework functions entirely (source already available)
+- Focus on clusters of unmapped FUN_ functions using call-graph analysis
+- Tasks identify what custom code does and which framework APIs it calls
+- Coverage measured against custom function count, not total
+
 ### Phase 2: Build (hybrid or pure lifting)
-**Hybrid mode** (when reference source is available):
+**Hybrid mode** (when reference source is available, full reconstruction):
 - Read Ghidra pseudocode AND original source for each mapped function
 - Produce output matching the original: same language, names, types, idioms
 - Unmapped functions fall back to cleaned Ghidra pseudocode
+
+**Custom extraction mode**:
+- Read Ghidra pseudocode for custom function clusters
+- Resolve framework API calls using function_map.tsv and helper_aliases.tsv
+- Produce clean source with meaningful names and framework API annotations
 
 **Pure mode** (closed-source binary):
 - Read Ghidra pseudocode, clean up types/names, infer meaning from context
@@ -92,6 +113,7 @@ output/
 ├── ghidra/           # Ghidra pre-analysis (function_boundaries, call_graph, decompiled functions)
 ├── discovery/        # Binary identity detection (identity.json)
 ├── mapping/          # Function→source mappings (function_map.tsv, helper_aliases.tsv)
+├── composition/      # Binary composition analysis (analysis.json — framework vs custom breakdown)
 ├── headers/          # Mach-O headers, load commands
 ├── symbols/          # Symbol tables, exports/imports
 ├── strings/          # Extracted strings

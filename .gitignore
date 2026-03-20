@@ -2,4 +2,5 @@
 /agent-knowledgebase
 /output
 /reference-src
+/tmp
 __pycache__/

@@ -45,6 +45,7 @@ TARGET_COVERAGE=${TARGET_COVERAGE:-100}
 ITERATION=0
 CYCLE=0
 BUILD_ERRORS=""
+ANALYSIS_MODE="full_reconstruction"
 
 PRD="output/prd.json"
 PROGRESS="output/progress.txt"
@@ -314,6 +315,385 @@ Otherwise, complete your one task and exit.
 BUILD_EOF
 }
 
+# ─── Prompt: custom extraction plan (when framework source is known) ─────────
+
+gen_custom_plan_prompt() {
+    local cycle_num="${1:-1}"
+    local build_errors="${2:-}"
+    local composition
+    composition=$(cat output/composition/analysis.json 2>/dev/null || echo '{}')
+
+    local existing_files=""
+    if [ -d "output/src" ]; then
+        existing_files=$(ls output/src/ 2>/dev/null | tr '\n' ', ')
+    fi
+
+    local archived_prds=""
+    if [ -d "output/records" ]; then
+        archived_prds=$(ls output/records/prd_cycle_*.json 2>/dev/null | tr '\n' ', ')
+    fi
+
+    cat <<CUSTOM_PLAN_EOF
+You are an autonomous binary analysis planner. Your goal is to extract and understand the CUSTOM application logic inside a binary that was built on top of a known open-source framework.
+
+## Target
+Binary file: \`$BINARY_PATH\`
+
+## Key Insight
+This binary was built using an open-source framework. The framework source is already available — DO NOT reconstruct it. Instead, focus on what is UNIQUE to this binary.
+
+## Composition Analysis
+\`\`\`json
+$composition
+\`\`\`
+
+## Available data
+- \`output/ghidra/function_boundaries.tsv\` — all detected functions
+- \`output/ghidra/call_graph.tsv\` — caller→callee relationships
+- \`output/ghidra/functions/<prefix>/<funcname>_<addr>.c\` — individual Ghidra decompilations
+- \`output/ghidra/module_chunks.tsv\` — address-prefix groupings
+- \`output/mapping/function_map.tsv\` — framework function→source mappings (ALREADY KNOWN — skip these)
+- \`output/mapping/helper_aliases.tsv\` — FUN_*→original name aliases
+- \`output/composition/analysis.json\` — function categorization breakdown
+- \`reference-src/\` — framework source (for understanding API calls only)
+${build_errors:+
+## Previous cycle result
+\`\`\`
+$build_errors
+\`\`\`}
+${existing_files:+
+## Already analyzed files (DO NOT recreate)
+\`\`\`
+$existing_files
+\`\`\`}
+${archived_prds:+Previous PRDs: $archived_prds}
+
+## Strategy: Triage → Classify → Extract
+
+The composition analysis has grouped unknown functions into address-proximity clusters.
+Your job has TWO phases:
+
+### Phase A: TRIAGE (classify each cluster)
+For the top clusters listed in \`analysis.json\`:
+1. Sample 2-3 functions from each cluster — read their Ghidra pseudocode
+2. Look at string literals, API call patterns, code structure
+3. Classify each cluster as one of:
+   - **"third_party"**: Recognizable open-source library (crypto, compression, parser, VM engine, etc.)
+     Include a \`libraryGuess\` field with your best guess of what it is
+   - **"custom"**: Application-specific logic unique to this binary
+   - **"runtime_generated"**: Compiler/VM-generated dispatch tables, trampolines, stubs
+
+### Phase B: PLAN (create tasks for custom + unknown clusters only)
+- Skip clusters classified as "third_party" or "runtime_generated"
+- Create reconstruction tasks ONLY for "custom" clusters
+
+### What to SKIP (already excluded by harness):
+- Functions in \`function_map.tsv\` (framework code)
+- Functions named \`thunk_*\`, \`__*\`, \`caseD_*\` (compiler artifacts)
+- Functions only called by framework code (propagated)
+
+### What to FOCUS ON:
+- Unclassified \`FUN_*\` function clusters from \`analysis.json\`
+- Use \`call_graph.tsv\` to understand inter-cluster relationships
+- Look for string references that reveal application-specific behavior
+- Check what framework APIs these functions call (translate via helper_aliases.tsv)
+
+### Steps
+1. Read \`output/composition/analysis.json\` — see \`top_clusters\` for prioritized cluster list
+2. For each top cluster: read 2-3 sample functions from \`output/ghidra/functions/<prefix>/\`
+3. Classify each cluster (third_party / custom / runtime_generated)
+4. For "custom" clusters: plan reconstruction tasks
+
+5. Generate \`output/prd.json\` with schema:
+   \`\`\`json
+   { "binaryTarget": "$BINARY_PATH", "binaryType": "DESC", "cycle": $cycle_num,
+     "analysisMode": "custom_extraction",
+     "triageResults": [
+       {"prefix": "1032be", "classification": "runtime_generated", "reason": "VM dispatch table"},
+       {"prefix": "102a80", "classification": "third_party", "libraryGuess": "JavaScriptCore DollarVM", "reason": "debug intrinsics"},
+       {"prefix": "102758", "classification": "custom", "reason": "app-specific Intl adapter"}
+     ],
+     "userStories": [{
+       "id": "US-001", "title": "...", "description": "...",
+       "ghidraFunctions": ["FUN_XXXXX"],
+       "addressRange": "0x100XXXX-0x100YYYY",
+       "targetSourceFile": "output/src/custom_module.c",
+       "clusterType": "custom",
+       "calledFrameworkAPIs": ["api_name1", "api_name2"],
+       "acceptanceCriteria": ["..."], "priority": 1, "passes": false, "notes": "" }]
+   }
+   \`\`\`
+
+   Task rules:
+   - 15-30 tasks, but ONLY for clusters classified as "custom"
+   - Include \`triageResults\` array so future cycles know what was already classified
+   - Order by: largest custom clusters first
+   - Each task: \`ghidraFunctions\`, \`addressRange\`, \`targetSourceFile\`, \`calledFrameworkAPIs\`
+   - DO NOT create tasks for third_party or runtime_generated clusters
+
+6. Generate \`output/progress.txt\` with analysis summary.
+
+## Rules
+- NEVER modify the target binary. All output inside \`output/\`
+- Every task must produce real source code in \`output/src/\`
+- Use framework API names (not FUN_*) when the custom code calls known functions
+
+## Completion
+When done, output: <promise>PLAN_COMPLETE</promise>
+CUSTOM_PLAN_EOF
+}
+
+# ─── Prompt: custom extraction build ─────────────────────────────────────────
+
+gen_custom_build_prompt() {
+    cat <<CUSTOM_BUILD_EOF
+You are an autonomous binary analysis agent. Your job: extract and reconstruct CUSTOM application logic from a binary built on a known framework.
+
+## Target
+Binary file: \`$BINARY_PATH\`
+
+## Context — read FIRST
+1. \`output/prd.json\` — task list with custom function clusters
+2. \`output/progress.txt\` — cumulative findings
+3. \`output/composition/analysis.json\` — function categorization
+
+## Available data
+- \`output/ghidra/functions/<prefix>/<funcname>_<addr>.c\` — Ghidra decompilations
+- \`output/ghidra/call_graph.tsv\` — caller→callee relationships
+- \`output/mapping/function_map.tsv\` — framework function mappings (for resolving API names)
+- \`output/mapping/helper_aliases.tsv\` — FUN_*→meaningful name aliases
+- \`reference-src/\` — framework source (read-only reference for understanding API contracts)
+
+## Workflow
+
+### Step 1: Identify your task
+Read \`output/prd.json\`, find the highest-priority task where \`passes\` is \`false\`.
+
+### Step 2: Analyze the custom function cluster
+
+For each function in the task's \`ghidraFunctions\`:
+
+a) Read the Ghidra pseudocode from \`output/ghidra/functions/\`
+b) Identify what framework APIs it calls:
+   - Look up callee FUN_* names in \`helper_aliases.tsv\` and \`function_map.tsv\`
+   - Replace FUN_* with meaningful names
+c) Determine the function's purpose from:
+   - String literals referenced
+   - Framework APIs called (check \`reference-src/\` to understand what those APIs do)
+   - Control flow patterns
+   - Data structures accessed
+d) Clean up the pseudocode:
+   - \`undefined8\` → \`uint64_t\`, \`FUN_*\` → meaningful names
+   - \`param_N\` → descriptive parameter names based on how they're used
+   - Add comments explaining the logic
+
+### Step 3: Write source files
+- Produce clean, readable C source (or match the framework language if evident)
+- Declare framework APIs as \`extern\` with their proper signatures
+- Add comments: \`// @ghidra: <address>\` and \`// calls: <framework_api_name>\`
+- Group related functions into logical modules
+
+### Step 4: Compile and verify
+- \`clang -std=c17 -target arm64-apple-macos -c <file> -o /dev/null 2>&1\`
+- For Zig: \`zig ast-check <file> 2>&1\`
+- Only set \`passes: true\` if verification succeeds
+
+### Step 5: Update state
+- Update \`output/prd.json\`: set \`passes: true\`, note what the custom code does
+- Append findings to \`output/progress.txt\`
+
+## CRITICAL RULES
+- Output must be REAL SOURCE CODE with meaningful names and proper types
+- Focus on UNDERSTANDING what the custom code does, not just cleaning syntax
+- Use framework API names (from mappings) instead of raw FUN_* addresses
+- ONE task per iteration
+- NEVER modify the target binary
+
+## Completion
+If ALL tasks have \`passes: true\`, output: <promise>CYCLE_DONE</promise>
+Otherwise, complete your one task and exit.
+CUSTOM_BUILD_EOF
+}
+
+# ─── Composition analysis ─────────────────────────────────────────────────────
+
+analyze_composition() {
+    echo "Analyzing binary composition..."
+    mkdir -p output/composition
+
+    python3 <<'COMPOSITION_PY'
+import csv, json, os
+from collections import defaultdict, Counter
+
+# Load all functions
+all_funcs = {}
+with open('output/ghidra/function_boundaries.tsv') as f:
+    for row in csv.DictReader(f, delimiter='\t'):
+        all_funcs[row['entry_address']] = row
+
+# Load mapped (framework) functions
+mapped_addrs = set()
+if os.path.exists('output/mapping/function_map.tsv'):
+    with open('output/mapping/function_map.tsv') as f:
+        for row in csv.DictReader(f, delimiter='\t'):
+            mapped_addrs.add(row.get('ghidra_address', ''))
+
+# Load call graph
+callers_of = defaultdict(set)  # func -> set of callers
+callees_of = defaultdict(set)  # func -> set of callees
+if os.path.exists('output/ghidra/call_graph.tsv'):
+    with open('output/ghidra/call_graph.tsv') as f:
+        reader = csv.DictReader(f, delimiter='\t')
+        for row in reader:
+            caller = row.get('caller_address', row.get('caller', ''))
+            callee = row.get('callee_address', row.get('callee', ''))
+            if caller and callee:
+                callees_of[caller].add(callee)
+                callers_of[callee].add(caller)
+
+# ── Step 1: Basic categorization (generic, no hardcoded library names) ──
+categories = {
+    'framework': [],
+    'compiler_system': [],
+    'unknown': [],
+}
+subcats = Counter()
+
+for addr, func in all_funcs.items():
+    name = func['name']
+
+    # Framework (mapped to source)
+    if addr in mapped_addrs:
+        categories['framework'].append(addr)
+        continue
+
+    # Compiler-generated trampolines
+    if name.startswith('thunk_'):
+        categories['compiler_system'].append(addr)
+        subcats['thunks'] += 1
+        continue
+
+    # System/runtime (double-underscore convention)
+    if name.startswith('__'):
+        categories['compiler_system'].append(addr)
+        subcats['system'] += 1
+        continue
+
+    # C++ mangled symbols (framework or third-party internals)
+    if name.startswith('_ZN') or name.startswith('_ZL') or name.startswith('_ZTV'):
+        categories['compiler_system'].append(addr)
+        subcats['cpp_mangled'] += 1
+        continue
+
+    # Switch/vtable artifacts
+    if name.startswith('caseD_') or name.startswith('switchD_'):
+        categories['compiler_system'].append(addr)
+        subcats['switch_cases'] += 1
+        continue
+
+    # Short libc-style named functions (not FUN_)
+    if not name.startswith('FUN_') and name.startswith('_') and len(name) < 30:
+        categories['compiler_system'].append(addr)
+        subcats['libc_style'] += 1
+        continue
+
+    # Everything else = unknown (to be clustered and triaged by agent)
+    categories['unknown'].append(addr)
+
+# ── Step 2: Address-proximity clustering (generic, works for any binary) ──
+# Group unknown functions by address prefix (6 hex chars = ~64KB blocks)
+# Functions from the same library/module tend to be linked contiguously
+addr_clusters = defaultdict(list)
+for addr in categories['unknown']:
+    prefix = addr[:6] if len(addr) > 6 else addr
+    addr_clusters[prefix].append(addr)
+
+# ── Step 3: Call-graph propagation from framework ──
+# If a function is ONLY called by framework functions, it's likely
+# framework-internal (inlined/optimized). Don't hardcode what it is.
+framework_addrs = set(categories['framework'])
+propagated_framework = []
+remaining_unknown = []
+for addr in categories['unknown']:
+    callers = callers_of.get(addr, set())
+    if callers and all(c in framework_addrs for c in callers):
+        propagated_framework.append(addr)
+    else:
+        remaining_unknown.append(addr)
+
+categories['unknown'] = remaining_unknown
+
+# ── Step 4: Build cluster summaries for agent triage ──
+total = len(all_funcs)
+
+# Re-cluster remaining unknown by address prefix
+unknown_clusters = defaultdict(list)
+for addr in categories['unknown']:
+    prefix = addr[:6] if len(addr) > 6 else addr
+    unknown_clusters[prefix].append(addr)
+
+# Build cluster info with size and connectivity data
+cluster_summaries = []
+for prefix in sorted(unknown_clusters.keys(), key=lambda k: -len(unknown_clusters[k])):
+    addrs = unknown_clusters[prefix]
+    total_size = sum(int(all_funcs[a].get('size', 0)) for a in addrs)
+    # Count how many framework APIs this cluster calls
+    fw_api_calls = 0
+    for a in addrs:
+        for callee in callees_of.get(a, set()):
+            if callee in framework_addrs:
+                fw_api_calls += 1
+    cluster_summaries.append({
+        'prefix': prefix,
+        'function_count': len(addrs),
+        'total_bytes': total_size,
+        'framework_api_calls': fw_api_calls,
+    })
+
+result = {
+    'total_functions': total,
+    'categories': {
+        'framework': {
+            'count': len(categories['framework']),
+            'pct': round(len(categories['framework']) * 100 / total, 1),
+            'description': 'Mapped to framework source (already known)',
+        },
+        'framework_propagated': {
+            'count': len(propagated_framework),
+            'pct': round(len(propagated_framework) * 100 / total, 1),
+            'description': 'Called only by framework (likely inlined/optimized framework code)',
+        },
+        'compiler_system': {
+            'count': len(categories['compiler_system']),
+            'pct': round(len(categories['compiler_system']) * 100 / total, 1),
+            'subcategories': dict(subcats),
+        },
+        'unknown': {
+            'count': len(categories['unknown']),
+            'pct': round(len(categories['unknown']) * 100 / total, 1),
+            'description': 'Unclassified — to be triaged by agent into third-party vs custom',
+            'cluster_count': len(unknown_clusters),
+            'top_clusters': cluster_summaries[:30],
+        },
+    },
+    'analysis_target_count': len(categories['unknown']),
+    'mode': 'custom_extraction' if len(categories['framework']) > total * 0.1 else 'full_reconstruction',
+}
+
+with open('output/composition/analysis.json', 'w') as f:
+    json.dump(result, f, indent=2)
+
+print(f"Framework (mapped):    {result['categories']['framework']['count']:,} ({result['categories']['framework']['pct']}%)")
+print(f"Framework (propagated):{result['categories']['framework_propagated']['count']:,} ({result['categories']['framework_propagated']['pct']}%)")
+print(f"Compiler/system:       {result['categories']['compiler_system']['count']:,} ({result['categories']['compiler_system']['pct']}%)")
+print(f"Unknown (to triage):   {result['categories']['unknown']['count']:,} ({result['categories']['unknown']['pct']}%)")
+print(f"  Address clusters:    {len(unknown_clusters)}")
+print(f"")
+print(f"Analysis target: {result['analysis_target_count']:,} functions in {len(unknown_clusters)} clusters")
+print(f"Recommended mode: {result['mode']}")
+COMPOSITION_PY
+}
+
 # ─── Agent spawner ───────────────────────────────────────────────────────────
 
 spawn_agent() {
@@ -343,7 +723,9 @@ measure_coverage() {
 
     local total_mapped lifted_funcs coverage_pct
 
-    if [ "$HAS_FUNCTION_MAP" = true ] && [ -f "output/mapping/function_map.tsv" ]; then
+    if [ "$ANALYSIS_MODE" = "custom_extraction" ] && [ -f "output/composition/analysis.json" ]; then
+        total_mapped=$(python3 -c "import json; d=json.load(open('output/composition/analysis.json')); print(d.get('analysis_target_count', 0))" 2>/dev/null)
+    elif [ "$HAS_FUNCTION_MAP" = true ] && [ -f "output/mapping/function_map.tsv" ]; then
         total_mapped=$(tail -n +2 output/mapping/function_map.tsv | wc -l | tr -d ' ')
     else
         total_mapped=$(tail -n +2 output/ghidra/function_boundaries.tsv | wc -l | tr -d ' ')
@@ -601,6 +983,45 @@ fi
 
 echo ""
 
+# ─── Phase 0.75: Composition analysis (when framework source is known) ───────
+
+if [ "$HAS_FUNCTION_MAP" = true ]; then
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║  COMPOSITION ANALYSIS                                       ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo ""
+
+    if [ ! -f "output/composition/analysis.json" ]; then
+        analyze_composition 2>&1 | tee -a "$RECORD_FILE"
+    else
+        echo "Composition analysis cached."
+        python3 -c "
+import json
+d = json.load(open('output/composition/analysis.json'))
+c = d['categories']
+print(f\"Framework:        {c['framework']['count']:,} ({c['framework']['pct']}%)\")
+print(f\"Third-party:      {c['third_party']['count']:,} ({c['third_party']['pct']}%)\")
+print(f\"Compiler/system:  {c['compiler_system']['count']:,} ({c['compiler_system']['pct']}%)\")
+print(f\"Custom/unknown:   {c['custom_unknown']['count']:,} ({c['custom_unknown']['pct']}%)\")
+print(f\"Recommended mode: {d['mode']}\")
+" 2>/dev/null
+    fi
+
+    # Auto-select mode based on composition
+    if [ -f "output/composition/analysis.json" ]; then
+        ANALYSIS_MODE=$(python3 -c "import json; print(json.load(open('output/composition/analysis.json')).get('mode', 'full_reconstruction'))" 2>/dev/null)
+        if [ "$ANALYSIS_MODE" = "custom_extraction" ]; then
+            echo ""
+            echo ">>> Mode: CUSTOM EXTRACTION — focusing on unique application logic"
+        else
+            echo ""
+            echo ">>> Mode: FULL RECONSTRUCTION — framework coverage too low for extraction"
+        fi
+    fi
+
+    echo ""
+fi
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN LOOP: Plan → Build → Verify → Re-plan if needed
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -640,10 +1061,13 @@ while true; do
         echo "Phase:  PLAN (cycle $CYCLE)"
         echo "Target: $BINARY_PATH"
         echo "Tool:   $TOOL"
+        echo "Mode:   $ANALYSIS_MODE"
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-        # Use replan prompt if we have existing source (expanding coverage)
-        if [ ! -f "$PRD" ] && [ -d "output/src" ] && find output/src -name '*.zig' -o -name '*.cpp' -o -name '*.c' 2>/dev/null | grep -q .; then
+        if [ "$ANALYSIS_MODE" = "custom_extraction" ]; then
+            echo "(Custom extraction mode — focusing on unique application logic)"
+            PLAN_PROMPT=$(gen_custom_plan_prompt "$CYCLE" "$BUILD_ERRORS")
+        elif [ ! -f "$PRD" ] && [ -d "output/src" ] && find output/src -name '*.zig' -o -name '*.cpp' -o -name '*.c' 2>/dev/null | grep -q .; then
             echo "(Expanding coverage — planning next batch)"
             PLAN_PROMPT=$(gen_replan_prompt "$CYCLE" "$BUILD_ERRORS")
         else
@@ -677,7 +1101,11 @@ while true; do
     [ "$MAX_ITERATIONS" -gt 0 ] && echo "Max:    $MAX_ITERATIONS total iterations"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    BUILD_PROMPT=$(gen_build_prompt)
+    if [ "$ANALYSIS_MODE" = "custom_extraction" ]; then
+        BUILD_PROMPT=$(gen_custom_build_prompt)
+    else
+        BUILD_PROMPT=$(gen_build_prompt)
+    fi
 
     while true; do
         if [ "$MAX_ITERATIONS" -gt 0 ] && [ "$ITERATION" -ge "$MAX_ITERATIONS" ]; then
