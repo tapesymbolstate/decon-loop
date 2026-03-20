@@ -9,10 +9,10 @@
 #   ./loop_decon.sh target-binaries/sample-binary codex-spark        # Codex Spark (fast), unlimited
 #
 # Multi-cycle workflow:
-#   1. Plan   → auto-generate PRD from binary recon (or existing findings)
-#   2. Build  → iterate through PRD tasks
+#   1. Plan   → auto-generate analysis plan from binary recon (or existing findings)
+#   2. Build  → iterate through plan tasks
 #   3. Verify → attempt to compile output/src/
-#   4. If compilation fails → archive PRD, re-plan with deeper tasks, goto 2
+#   4. If compilation fails → archive plan, re-plan with deeper tasks, goto 2
 #   5. Repeat until source compiles or max_iterations reached
 #
 # Completion = source in output/src/ compiles successfully
@@ -48,7 +48,7 @@ CYCLE=0
 BUILD_ERRORS=""
 ANALYSIS_MODE="full_reconstruction"
 
-PRD="output/prd.json"
+PLAN="output/analysis_plan.json"
 PROGRESS="output/progress.txt"
 
 # ─── Records setup ───────────────────────────────────────────────────────────
@@ -116,7 +116,7 @@ $mapping_section
 
 3. Create: \`mkdir -p output/{headers,symbols,strings,reports,src,records}\`
 
-4. Generate \`output/prd.json\` with schema:
+4. Generate \`output/analysis_plan.json\` with schema:
    \`\`\`json
    { "binaryTarget": "$BINARY_PATH", "binaryType": "DESC", "cycle": 1,
      "userStories": [{ "id": "US-001", "title": "...", "description": "...",
@@ -168,10 +168,10 @@ gen_replan_prompt() {
         existing_files=$(ls output/src/ 2>/dev/null | tr '\n' ', ')
     fi
 
-    # List archived PRD files for context
-    local archived_prds=""
+    # List archived plan files for context
+    local archived_plans=""
     if [ -d "output/records" ]; then
-        archived_prds=$(ls output/records/prd_cycle_*.json 2>/dev/null | tr '\n' ', ')
+        archived_plans=$(ls output/records/plan_cycle_*.json 2>/dev/null | tr '\n' ', ')
     fi
 
     cat <<REPLAN_EOF
@@ -194,7 +194,7 @@ $build_errors
 \`\`\`
 $existing_files
 \`\`\`
-${archived_prds:+Previous PRDs: $archived_prds}
+${archived_plans:+Previous plans: $archived_plans}
 
 ## Available data
 - \`output/progress.txt\`, \`output/src/\` (already lifted code — keep these!)
@@ -203,7 +203,7 @@ $mapping_note
 ## Job
 1. Read \`output/mapping/function_map.tsv\` (or \`function_boundaries.tsv\`) to find functions NOT yet covered by existing source files
 2. Read \`output/ghidra/module_chunks.tsv\` to identify the next batch of address-prefix groups to lift
-3. Generate NEW \`output/prd.json\` (\`"cycle": $cycle_num\`):
+3. Generate NEW \`output/analysis_plan.json\` (\`"cycle": $cycle_num\`):
    - Plan 15-25 NEW tasks covering functions not in existing source files
    - Every task: \`ghidraFunctions\`, \`addressRange\`, \`targetSourceFile\`
    - If mapping available: include \`sourceFiles\`, match output language to original
@@ -261,13 +261,13 @@ You are an autonomous source reconstruction agent. Your job: produce clean, read
 Binary file: \`$BINARY_PATH\`
 
 ## Context — read FIRST
-1. \`output/prd.json\` — task list with \`ghidraFunctions\`, \`targetSourceFile\`, and optionally \`sourceFiles\`
+1. \`output/analysis_plan.json\` — task list with \`ghidraFunctions\`, \`targetSourceFile\`, and optionally \`sourceFiles\`
 2. \`output/progress.txt\` — cumulative findings
 $mapping_section
 ## Workflow
 
 ### Step 1: Identify your task
-Read \`output/prd.json\`, find the highest-priority task where \`passes\` is \`false\`.
+Read \`output/analysis_plan.json\`, find the highest-priority task where \`passes\` is \`false\`.
 
 ### Step 2: For each function in the task
 
@@ -300,7 +300,7 @@ e) Write as clean C
 - Only set \`passes: true\` if verification succeeds
 
 ### Step 5: Update state
-- Update \`output/prd.json\`: set \`passes: true\`, note function count and accuracy
+- Update \`output/analysis_plan.json\`: set \`passes: true\`, note function count and accuracy
 - Append to \`output/progress.txt\`
 
 ## CRITICAL RULES
@@ -329,9 +329,9 @@ gen_custom_plan_prompt() {
         existing_files=$(ls output/src/ 2>/dev/null | tr '\n' ', ')
     fi
 
-    local archived_prds=""
+    local archived_plans=""
     if [ -d "output/records" ]; then
-        archived_prds=$(ls output/records/prd_cycle_*.json 2>/dev/null | tr '\n' ', ')
+        archived_plans=$(ls output/records/plan_cycle_*.json 2>/dev/null | tr '\n' ', ')
     fi
 
     cat <<CUSTOM_PLAN_EOF
@@ -367,7 +367,7 @@ ${existing_files:+
 \`\`\`
 $existing_files
 \`\`\`}
-${archived_prds:+Previous PRDs: $archived_prds}
+${archived_plans:+Previous plans: $archived_plans}
 
 ## Strategy: Triage → Classify → Extract
 
@@ -405,7 +405,7 @@ For the top clusters listed in \`analysis.json\`:
 3. Classify each cluster (third_party / custom / runtime_generated)
 4. For "custom" clusters: plan reconstruction tasks
 
-5. Generate \`output/prd.json\` with schema:
+5. Generate \`output/analysis_plan.json\` with schema:
    \`\`\`json
    { "binaryTarget": "$BINARY_PATH", "binaryType": "DESC", "cycle": $cycle_num,
      "analysisMode": "custom_extraction",
@@ -454,7 +454,7 @@ You are an autonomous binary analysis agent. Your job: extract and reconstruct C
 Binary file: \`$BINARY_PATH\`
 
 ## Context — read FIRST
-1. \`output/prd.json\` — task list with custom function clusters
+1. \`output/analysis_plan.json\` — task list with custom function clusters
 2. \`output/progress.txt\` — cumulative findings
 3. \`output/composition/analysis.json\` — function categorization
 
@@ -468,7 +468,7 @@ Binary file: \`$BINARY_PATH\`
 ## Workflow
 
 ### Step 1: Identify your task
-Read \`output/prd.json\`, find the highest-priority task where \`passes\` is \`false\`.
+Read \`output/analysis_plan.json\`, find the highest-priority task where \`passes\` is \`false\`.
 
 ### Step 2: Analyze the custom function cluster
 
@@ -500,7 +500,7 @@ d) Clean up the pseudocode:
 - Only set \`passes: true\` if verification succeeds
 
 ### Step 5: Update state
-- Update \`output/prd.json\`: set \`passes: true\`, note what the custom code does
+- Update \`output/analysis_plan.json\`: set \`passes: true\`, note what the custom code does
 - Append findings to \`output/progress.txt\`
 
 ## CRITICAL RULES
@@ -726,12 +726,17 @@ measure_coverage() {
 
     local total_mapped lifted_funcs coverage_pct
 
-    if [ "$ANALYSIS_MODE" = "custom_extraction" ] && [ -f "output/composition/analysis.json" ]; then
+    if [ "$ANALYSIS_MODE" = "bun_compiled_app" ] && [ -f "$PLAN" ]; then
+        # For bun apps, total = number of tasks in analysis plan
+        total_mapped=$(python3 -c "import json; d=json.load(open('$PLAN')); print(len(d.get('userStories', [])))" 2>/dev/null || echo 0)
+    elif [ "$ANALYSIS_MODE" = "custom_extraction" ] && [ -f "output/composition/analysis.json" ]; then
         total_mapped=$(python3 -c "import json; d=json.load(open('output/composition/analysis.json')); print(d.get('analysis_target_count', 0))" 2>/dev/null)
     elif [ "$HAS_FUNCTION_MAP" = true ] && [ -f "output/mapping/function_map.tsv" ]; then
         total_mapped=$(tail -n +2 output/mapping/function_map.tsv | wc -l | tr -d ' ')
-    else
+    elif [ -f "output/ghidra/function_boundaries.tsv" ]; then
         total_mapped=$(tail -n +2 output/ghidra/function_boundaries.tsv | wc -l | tr -d ' ')
+    else
+        total_mapped=0
     fi
 
     # Count function definitions across all source languages
@@ -746,6 +751,17 @@ measure_coverage() {
         zig_funcs=$(find output/src -name '*.zig' -exec grep -cE '^\s*(pub\s+)?(export\s+)?fn\s+' {} \; 2>/dev/null | awk '{s+=$1}END{print s+0}')
         lifted_funcs=$((lifted_funcs + zig_funcs))
     fi
+    # JavaScript/TypeScript functions
+    if find output/src -name '*.js' -o -name '*.ts' 2>/dev/null | grep -q .; then
+        local js_funcs
+        js_funcs=$(find output/src \( -name '*.js' -o -name '*.ts' \) -exec grep -cE '^\s*(export\s+)?(async\s+)?function\s+|^\s*(const|let|var)\s+\w+\s*=\s*(async\s+)?\(' {} \; 2>/dev/null | awk '{s+=$1}END{print s+0}')
+        lifted_funcs=$((lifted_funcs + js_funcs))
+    fi
+
+    # For bun_compiled_app, count completed tasks instead of function defs
+    if [ "$ANALYSIS_MODE" = "bun_compiled_app" ] && [ -f "$PLAN" ]; then
+        lifted_funcs=$(python3 -c "import json; d=json.load(open('$PLAN')); print(sum(1 for s in d.get('userStories', []) if s.get('passes')))" 2>/dev/null || echo 0)
+    fi
 
     if [ "$total_mapped" -gt 0 ]; then
         coverage_pct=$((lifted_funcs * 100 / total_mapped))
@@ -755,7 +771,7 @@ measure_coverage() {
 
     # Count total LOC across all languages
     local all_src_files total_loc total_files
-    all_src_files=$(find output/src -name '*.cpp' -o -name '*.c' -o -name '*.zig' -o -name '*.rs' -o -name '*.h' 2>/dev/null)
+    all_src_files=$(find output/src -name '*.cpp' -o -name '*.c' -o -name '*.zig' -o -name '*.rs' -o -name '*.h' -o -name '*.js' -o -name '*.ts' 2>/dev/null)
     if [ -n "$all_src_files" ]; then
         total_files=$(echo "$all_src_files" | wc -l | tr -d ' ')
         total_loc=$(echo "$all_src_files" | xargs wc -l 2>/dev/null | tail -1 | awk '{print $1}')
@@ -783,10 +799,10 @@ verify_build() {
 
     # ── Gate A: source files exist (any language) ──
     local all_src
-    all_src=$(find output/src -name '*.cpp' -o -name '*.c' -o -name '*.zig' -o -name '*.rs' -o -name '*.h' 2>/dev/null)
+    all_src=$(find output/src -name '*.cpp' -o -name '*.c' -o -name '*.zig' -o -name '*.rs' -o -name '*.h' -o -name '*.js' -o -name '*.ts' 2>/dev/null)
     if [ -z "$all_src" ]; then
         echo "FAIL: No source files in output/src/"
-        BUILD_ERRORS="No source files found in output/src/. Must lift Ghidra functions into compilable source."
+        BUILD_ERRORS="No source files found in output/src/."
         return 1
     fi
 
@@ -797,7 +813,7 @@ verify_build() {
     echo "Source: $file_count files, $loc LOC"
 
     if [ "$loc" -lt 500 ]; then
-        echo "FAIL: Only $loc LOC (need ≥500)."
+        echo "FAIL: Only $loc LOC (need >=500)."
         BUILD_ERRORS="QUALITY: Only $loc lines of code across $file_count files. Minimum 500 LOC required."
         return 1
     fi
@@ -816,14 +832,20 @@ verify_build() {
         zig_funcs=$(find output/src -name '*.zig' -exec grep -cE '^\s*(pub\s+)?(export\s+)?fn\s+' {} \; 2>/dev/null | awk '{s+=$1}END{print s+0}')
         func_defs=$((func_defs + zig_funcs))
     fi
+    # JavaScript/TypeScript functions
+    if find output/src -name '*.js' -o -name '*.ts' 2>/dev/null | grep -q .; then
+        local js_funcs
+        js_funcs=$(find output/src \( -name '*.js' -o -name '*.ts' \) -exec grep -cE '^\s*(export\s+)?(async\s+)?function\s+|^\s*(const|let|var)\s+\w+\s*=\s*(async\s+)?\(' {} \; 2>/dev/null | awk '{s+=$1}END{print s+0}')
+        func_defs=$((func_defs + js_funcs))
+    fi
     echo "Function definitions: $func_defs"
     if [ "$func_defs" -lt 10 ]; then
-        echo "FAIL: Only $func_defs function definitions (need ≥10)."
+        echo "FAIL: Only $func_defs function definitions (need >=10)."
         BUILD_ERRORS="QUALITY: Only $func_defs function definitions found."
         return 1
     fi
 
-    # ── Gate D: compilation per language ──
+    # ── Gate D: syntax verification per language ──
     local errors="" compile_rc=0
 
     # C/C++ compilation
@@ -850,14 +872,26 @@ verify_build() {
         done < <(find output/src -name '*.zig')
     fi
 
+    # JavaScript syntax check (node --check)
+    if find output/src -name '*.js' 2>/dev/null | grep -q .; then
+        while IFS= read -r srcfile; do
+            file_errors=$(node --check "$srcfile" 2>&1)
+            file_rc=$?
+            if [ "$file_rc" -ne 0 ]; then
+                compile_rc=$file_rc
+                errors="${errors}${srcfile}: ${file_errors}\n"
+            fi
+        done < <(find output/src -name '*.js')
+    fi
+
     if [ "$compile_rc" -ne 0 ] || [ -n "$errors" ]; then
-        echo "FAIL: Compilation errors."
+        echo "FAIL: Syntax/compilation errors."
         echo -e "$errors" | head -50
         BUILD_ERRORS="COMPILATION:\n$errors"
         return 1
     fi
 
-    echo "ALL GATES PASSED: $file_count files, $loc LOC, $func_defs functions, compiles clean."
+    echo "ALL GATES PASSED: $file_count files, $loc LOC, $func_defs functions, syntax clean."
     BUILD_ERRORS=""
     return 0
 }
@@ -1115,32 +1149,42 @@ CHUNK_PY
     echo "Ghidra decompilation is not needed for app logic extraction."
     echo ""
 
-    # Generate a PRD for the AI agent to analyze the extracted JS
+    # Generate an analysis plan for the AI agent to analyze the extracted JS
     ANALYSIS_MODE="bun_compiled_app"
 
     gen_bun_app_plan_prompt() {
+        # Build actual chunk file list for the prompt
+        local chunk_list
+        chunk_list=$(ls output/bundled_app/chunks/chunk_*.js 2>/dev/null | head -5 | tr '\n' ', ')
+
         cat <<BUN_PLAN_EOF
 You are a source code analyst. A \`bun build --compile\` binary has been extracted.
 
 ## Data
 - \`output/bundled_app/app_info.json\` — app metadata
 - \`output/bundled_app/chunks/\` — beautified JS code split into ~400-line chunks
+- Chunk filenames follow the pattern: \`chunk_NNN_LSTART-LEND.js\` (e.g. \`chunk_000_L1-L635.js\`)
 
 ## Job
 1. Read \`output/bundled_app/app_info.json\`
 2. Run \`ls output/bundled_app/chunks/ | wc -l\` to see how many chunks exist
-3. Sample chunks at intervals (chunk_000, chunk_050, chunk_100, chunk_200, chunk_400, chunk_600) — read first 30 lines of each
-4. Group chunks into 15-25 modules by purpose, create \`output/prd.json\`:
+3. Run \`ls output/bundled_app/chunks/\` to get the EXACT filenames
+4. Sample chunks at intervals (chunk_000, chunk_050, chunk_100, chunk_200, chunk_400, chunk_600) — read first 30 lines of each
+5. Group chunks into 15-25 modules by purpose, create \`output/analysis_plan.json\`:
    \`\`\`json
    { "binaryTarget": "$BINARY_PATH", "analysisMode": "bun_compiled_app", "cycle": 1,
      "userStories": [{ "id": "US-001", "title": "Module name",
-       "chunkFiles": ["output/bundled_app/chunks/chunk_NNN_*.js"],
+       "chunkRange": { "start": 0, "end": 24 },
        "targetSourceFile": "output/src/module_name.js",
        "priority": 1, "passes": false }] }
    \`\`\`
-5. Write \`output/progress.txt\` with app overview
 
-Keep PRD under 30KB. 15-25 tasks max. Group adjacent chunks into modules.
+   IMPORTANT: Use \`chunkRange\` with numeric start/end indices (NOT glob patterns).
+   The build agent will expand \`{"start": 0, "end": 24}\` to read chunk_000 through chunk_024.
+
+6. Write \`output/progress.txt\` with app overview
+
+Keep analysis_plan.json under 30KB. 15-25 tasks max. Group adjacent chunks into modules.
 
 When done: <promise>PLAN_COMPLETE</promise>
 BUN_PLAN_EOF
@@ -1148,26 +1192,40 @@ BUN_PLAN_EOF
 
     gen_bun_app_build_prompt() {
         cat <<BUN_BUILD_EOF
-You are a JavaScript deobfuscator. Read a chunk of beautified-but-mangled JS and rewrite it with meaningful names.
+You are a JavaScript deobfuscator. Read beautified-but-mangled JS chunks and rewrite them with meaningful names.
 
 ## Context
-1. \`output/prd.json\` — task list
+1. \`output/analysis_plan.json\` — task list with \`chunkRange\` per task
 2. \`output/progress.txt\` — previous findings and name mappings
 
+## How to resolve chunk files
+Each task has a \`chunkRange\` field like \`{"start": 0, "end": 24}\`.
+To find the actual files, run:
+\`\`\`
+ls output/bundled_app/chunks/chunk_0{00..24}_*.js
+\`\`\`
+Or more reliably:
+\`\`\`
+ls output/bundled_app/chunks/ | grep -E '^chunk_0(0[0-9]|1[0-9]|2[0-4])_' | head
+\`\`\`
+Each chunk file is named like \`chunk_NNN_LSTART-LEND.js\`.
+
 ## Job
-1. Pick the first task in \`output/prd.json\` where \`passes\` is \`false\`
-2. Read its \`chunkFiles\`
-3. Rewrite the code:
+1. Pick the first task in \`output/analysis_plan.json\` where \`passes\` is \`false\`
+2. Resolve the chunk files from its \`chunkRange\` (see above)
+3. Read the chunk files for this task (cat or read each one)
+4. Rewrite the code into a clean JavaScript module:
    - Rename ALL single-letter and mangled identifiers to meaningful names
    - Use string literals, error messages, property names, and API URLs as clues
    - Replace \`!0\` with \`true\`, \`!1\` with \`false\`, \`void 0\` with \`undefined\`
    - Add brief comments for non-obvious logic
-   - Preserve all logic exactly
-4. Write to the \`targetSourceFile\` path (mkdir -p first)
-5. Append name mappings to \`output/progress.txt\`
-6. Set \`passes: true\` in \`output/prd.json\`
+   - Preserve all logic exactly — do NOT change behavior
+   - Output valid JavaScript (ES module style where applicable)
+5. Write to the task's \`targetSourceFile\` path (\`mkdir -p output/src\` first)
+6. Append discovered name mappings to \`output/progress.txt\`
+7. Update \`output/analysis_plan.json\`: set this task's \`passes\` to \`true\`
 
-ONE task per iteration. When all done: <promise>CYCLE_DONE</promise>
+ONE task per iteration. When ALL tasks have \`passes: true\`, output: <promise>CYCLE_DONE</promise>
 BUN_BUILD_EOF
     }
 
@@ -1352,9 +1410,9 @@ fi  # end IS_BUN_COMPILED=false (Ghidra + discovery + mapping + composition)
 # MAIN LOOP: Plan → Build → Verify → Re-plan if needed
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Handle resume: if PRD exists with all tasks done, skip straight to verify+coverage
-if [ -f "$PRD" ] && ! python3 -c "import json,sys; d=json.load(open('$PRD')); sys.exit(0 if any(not s['passes'] for s in d['userStories']) else 1)" 2>/dev/null; then
-    echo "Existing PRD found with all tasks complete. Checking coverage..."
+# Handle resume: if plan exists with all tasks done, skip straight to verify+coverage
+if [ -f "$PLAN" ] && ! python3 -c "import json,sys; d=json.load(open('$PLAN')); sys.exit(0 if any(not s['passes'] for s in d['userStories']) else 1)" 2>/dev/null; then
+    echo "Existing plan found with all tasks complete. Checking coverage..."
     CYCLE=$((CYCLE + 1))
     BUILD_ERRORS=""
     if verify_build; then
@@ -1365,8 +1423,8 @@ if [ -f "$PRD" ] && ! python3 -c "import json,sys; d=json.load(open('$PRD')); sy
         fi
         echo "Coverage: $COVERAGE_PCT% (target: $TARGET_COVERAGE%). Expanding..."
         BUILD_ERRORS="COVERAGE: Only $COVERAGE_PCT% of functions lifted ($COVERAGE_FUNCS/$COVERAGE_TOTAL). Need $TARGET_COVERAGE%. Already completed files: $(ls output/src/ 2>/dev/null | tr '\n' ', ')"
-        cp "$PRD" "output/records/prd_cycle_${CYCLE}.json" 2>/dev/null
-        rm -f "$PRD"
+        cp "$PLAN" "output/records/plan_cycle_${CYCLE}.json" 2>/dev/null
+        rm -f "$PLAN"
     fi
 fi
 
@@ -1381,7 +1439,7 @@ while true; do
 
     # ─── Plan phase ───────────────────────────────────────────────────────
 
-    if [ ! -f "$PRD" ] || ! python3 -c "import json,sys; d=json.load(open('$PRD')); sys.exit(0 if any(not s['passes'] for s in d['userStories']) else 1)" 2>/dev/null; then
+    if [ ! -f "$PLAN" ] || ! python3 -c "import json,sys; d=json.load(open('$PLAN')); sys.exit(0 if any(not s['passes'] for s in d['userStories']) else 1)" 2>/dev/null; then
 
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         echo "Phase:  PLAN (cycle $CYCLE)"
@@ -1396,7 +1454,7 @@ while true; do
         elif [ "$ANALYSIS_MODE" = "custom_extraction" ]; then
             echo "(Custom extraction mode — focusing on unique application logic)"
             PLAN_PROMPT=$(gen_custom_plan_prompt "$CYCLE" "$BUILD_ERRORS")
-        elif [ ! -f "$PRD" ] && [ -d "output/src" ] && find output/src -name '*.zig' -o -name '*.cpp' -o -name '*.c' 2>/dev/null | grep -q .; then
+        elif [ ! -f "$PLAN" ] && [ -d "output/src" ] && find output/src -name '*.zig' -o -name '*.cpp' -o -name '*.c' 2>/dev/null | grep -q .; then
             echo "(Expanding coverage — planning next batch)"
             PLAN_PROMPT=$(gen_replan_prompt "$CYCLE" "$BUILD_ERRORS")
         else
@@ -1409,11 +1467,12 @@ while true; do
         echo "$OUTPUT" | tee -a "$RECORD_FILE"
 
         # Recover misplaced files
-        [ ! -f "$PRD" ] && [ -f "prd.json" ] && mv prd.json "$PRD"
+        [ ! -f "$PLAN" ] && [ -f "analysis_plan.json" ] && mv analysis_plan.json "$PLAN"
+        [ ! -f "$PLAN" ] && [ -f "prd.json" ] && mv prd.json "$PLAN"
         [ ! -f "$PROGRESS" ] && [ -f "progress.txt" ] && mv progress.txt "$PROGRESS"
 
-        if [ ! -f "$PRD" ]; then
-            echo "Error: Plan phase did not generate output/prd.json"
+        if [ ! -f "$PLAN" ]; then
+            echo "Error: Plan phase did not generate $PLAN"
             exit 1
         fi
 
@@ -1460,9 +1519,9 @@ while true; do
             continue
         fi
 
-        # Check if all current PRD tasks are done
+        # Check if all current plan tasks are done
         if echo "$OUTPUT" | tail -30 | grep -q '<promise>CYCLE_DONE</promise>'; then
-            echo "All PRD tasks complete for cycle $CYCLE."
+            echo "All plan tasks complete for cycle $CYCLE."
             break
         fi
 
@@ -1492,12 +1551,12 @@ while true; do
 
         echo ""
         echo "Verification passed but coverage is $COVERAGE_PCT% (target: $TARGET_COVERAGE%)."
-        echo "Archiving PRD and planning next batch..."
+        echo "Archiving plan and planning next batch..."
         BUILD_ERRORS="COVERAGE: Only $COVERAGE_PCT% of functions lifted ($COVERAGE_FUNCS/$COVERAGE_TOTAL). Need $TARGET_COVERAGE%. Already completed files: $(ls output/src/ 2>/dev/null | tr '\n' ', ')"
 
-        # Archive current PRD and force re-plan for next batch
-        cp "$PRD" "output/records/prd_cycle_${CYCLE}.json" 2>/dev/null
-        rm -f "$PRD"
+        # Archive current plan and force re-plan for next batch
+        cp "$PLAN" "output/records/plan_cycle_${CYCLE}.json" 2>/dev/null
+        rm -f "$PLAN"
     fi
 
     echo ""

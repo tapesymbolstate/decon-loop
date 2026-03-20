@@ -26,7 +26,7 @@ If you find yourself writing code that only works for one specific binary, STOP 
 - Perform exactly one analysis task per iteration
 - Always record discovered code patterns and structural insights in progress.txt
 - Save large outputs to files; only write summaries in progress.txt
-- Reconstructed source MUST compile. If it doesn't compile yet, mark the task as failing in prd.json and log the build errors in progress.txt
+- Reconstructed source MUST compile. If it doesn't compile yet, mark the task as failing in analysis_plan.json and log the build errors in progress.txt
 - When deobfuscating, preserve original logic exactly — rename symbols to meaningful names but never alter behavior
 
 ## Target Binaries
