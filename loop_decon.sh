@@ -1233,18 +1233,65 @@ BUN_BUILD_EOF
 
     gen_restructure_prompt() {
         cat <<'RESTRUCTURE_EOF'
-You are a JavaScript project architect. Read deobfuscated flat modules and rewrite them into a clean, human-manageable project.
+You are a software project architect. Read deobfuscated flat source files and rewrite them into a clean, human-manageable, RE-EXECUTABLE project.
 
 ## Input (READ-ONLY — do NOT modify these)
-- `output/src/*.js` — flat deobfuscated modules (some are 2000-4000+ LOC)
+- `output/src/` — flat deobfuscated source files (some are 2000-4000+ LOC)
 - `output/progress.txt` — name mappings and subsystem notes
 
 ## Output directory
 - `output/src-structured/` — write ALL output here (`mkdir -p` first)
 - NEVER modify anything in `output/src/`
 
-## Goal
-Produce a project structure that a working engineer could realistically maintain. Think "what would a senior dev expect if they inherited this codebase?" — clear module boundaries, files organized by domain, and each file small enough to reason about without scrolling endlessly. Use your judgment on granularity; the bar is practical maintainability, not a strict LOC target.
+## Step 0: Detect language and ecosystem (first iteration only)
+Before processing any files, inspect `output/src/` to determine:
+- **Language**: file extensions, syntax patterns (JS/TS? Go? Rust? C++? Python? Zig?)
+- **Module system**: ESM import/export? CommonJS require? Go packages? Rust mod/use? Python import?
+- **Runtime**: Node/Bun/Deno? Go binary? Rust binary? CPython?
+- **External dependencies**: library imports that are not local modules
+
+Write your findings to `output/src-structured/PROJECT_META.json`:
+```json
+{
+  "language": "javascript",
+  "moduleSystem": "esm",
+  "runtime": "node",
+  "fileExtension": ".js",
+  "syntaxCheckCommand": "node --check",
+  "buildTool": "npm",
+  "manifestFile": "package.json",
+  "externalDependencies": {
+    "react": { "hint": ">=18.0.0", "evidence": "uses createRoot, concurrent features" },
+    "zod": { "hint": ">=3.22.0", "evidence": "z.pipe() usage found" }
+  }
+}
+```
+
+### Version hints for external dependencies
+Exact versions are lost during bundling, but you can infer version RANGES from API usage. For each external dependency, record:
+- `hint`: a semver range like `>=4.0.0` or `^3.22.0`
+- `evidence`: WHY you think this version — which API, class, function, or pattern you saw that narrows it down
+
+Sources of version evidence (check in order):
+1. **Embedded version strings**: grep the source for patterns like `version = "1.2.3"`, `VERSION`, `USER_AGENT` containing semver
+2. **API surface**: newer APIs narrow the minimum version (e.g. `z.pipe()` → zod >=3.22, `createRoot` → react >=18)
+3. **Import paths**: deep imports like `@aws-sdk/client-bedrock-runtime` indicate SDK v3+
+4. **String literals**: error messages, user-agent strings, changelog references
+5. **Registry lookup by build date**: if no direct evidence is found, determine the binary's build date (from embedded timestamps, version strings, file metadata, etc.) and query the package registry (npm, crates.io, PyPI, etc.) to find the latest version of each dependency that was available at that build date. Use `curl` or equivalent to check the registry API. For example, for npm: `curl -s https://registry.npmjs.org/<pkg> | jq '.time'` gives publish dates for all versions — pick the latest one published before the binary's build date. Record the build date in PROJECT_META.json as `"buildDate"` so this only needs to be determined once.
+
+Update `externalDependencies` in PROJECT_META.json incrementally as you process each source file — new imports may appear in later files that refine earlier guesses.
+
+Use this metadata to drive ALL subsequent decisions (syntax checking, manifest generation, directory conventions, import style). Do NOT hardcode any language-specific assumptions.
+
+## Ultimate Goal
+The end state is a project that can be **fully re-executed** — not just readable, but runnable. This means:
+1. Clean module boundaries organized by domain
+2. Correct dependency wiring (imports/includes resolve, external deps identified)
+3. A valid build manifest (package.json, go.mod, Cargo.toml, etc. — whatever fits the detected language)
+4. A clear entrypoint so the appropriate runtime can launch the app
+5. A human-readable `README.md` that documents the architecture
+
+Think "what would a senior dev need to clone this repo, install deps, and run it?"
 
 ## Job
 
@@ -1257,34 +1304,61 @@ Produce a project structure that a working engineer could realistically maintain
 ### Phase 2: Split and write
 1. For each identified concern, write a focused module to the appropriate domain directory under `output/src-structured/`
 2. Each output file must:
-   - Have a clear, descriptive filename (kebab-case)
+   - Have a clear, descriptive filename (kebab-case for JS/TS, snake_case for Go/Rust/Python — match language convention)
    - Contain only ONE logical concern
    - Be 200-500 LOC (hard max 800)
-   - Have correct relative imports to other files already in `output/src-structured/`
-3. Run `node --check` on every file you write
+   - Have correct relative imports/includes to other files already in `output/src-structured/`
+3. Run the language-appropriate syntax check (from PROJECT_META.json) on every file you write
 
-### Phase 3: Track progress
+### Phase 3: Update README.md
+After each source file is processed, update `output/src-structured/README.md` with accumulated knowledge:
+- **Architecture overview**: what the app does, how modules connect
+- **Domain directory guide**: what each directory contains and its role
+- **Key modules**: the most important files and what they do
+- **External dependencies**: what libraries are used and why
+- **Entrypoint & boot sequence**: how the app starts up
+- **Build & run instructions**: exact commands to build and execute
+- **Notes for contributors**: gotchas, patterns, naming conventions found during decompilation
+
+This README is a living knowledge document — add to it incrementally as you process each file. It should help a human understand the codebase without reading every file.
+
+### Phase 4: Track progress
 Update `output/restructure_progress.json`:
 ```json
 {
-  "completed": ["bootstrap_docs_telemetry_models.js", ...],
-  "remaining": ["anthropic_client_commands_sandbox.js", ...],
+  "completed": ["source_file_a", ...],
+  "remaining": ["source_file_b", ...],
   "outputFiles": 42,
-  "totalLOC": 49226
+  "totalLOC": 12345
 }
 ```
 
-### Domain directories to use (create as needed)
-`core/`, `api/`, `auth/`, `cli/`, `mcp/`, `tools/`, `ui/`, `plugins/`, `providers/`, `security/`, `telemetry/`, `remote/`, `validation/`, `parsers/`, `sessions/`
+### Phase 5: Finalize (when all source files are done)
+After the last source file is processed:
+1. Generate the appropriate build manifest for the detected language:
+   - JS/TS: `package.json` with dependencies, `"type": "module"` if ESM, entrypoint, scripts
+   - Go: `go.mod` with module path and dependencies
+   - Rust: `Cargo.toml` with dependencies and binary target
+   - Python: `pyproject.toml` or `requirements.txt`
+   - C/C++: `CMakeLists.txt` or `Makefile`
+   - Other: whatever is idiomatic for the language
+2. Finalize `README.md` with complete architecture and build/run instructions
+3. Verify: syntax check all files, imports/includes resolve correctly
+
+### Domain directories
+Create directories as needed based on the code's actual domain structure. Common patterns:
+`core/`, `api/`, `auth/`, `cli/`, `config/`, `tools/`, `ui/`, `plugins/`, `providers/`, `security/`, `telemetry/`, `remote/`, `validation/`, `parsers/`, `sessions/`, `net/`, `storage/`
+
+Use whatever makes sense for the specific codebase — these are suggestions, not requirements.
 
 ### Rules
 - NEVER modify `output/src/`
-- ONE source file per iteration — do NOT try to process all 25 at once
-- Split by responsibility: keep related classes and functions together if they share state or form a cohesive unit
-- Preserve ALL exports — every export from the source must appear in some output file
-- Use relative imports between output files
-- Do NOT create barrel/index.js files — direct imports only
-- If you see `import ... from "./some_file.js"` in the source, resolve it to the correct path in `output/src-structured/`
+- ONE source file per iteration — do NOT try to process all files at once
+- Split by responsibility: keep related classes/functions/types together if they share state or form a cohesive unit
+- Preserve ALL exports/public symbols — every export from the source must appear in some output file
+- Use the language-idiomatic import/include mechanism between output files
+- Do NOT create barrel/index files — direct imports only
+- Resolve cross-references from the flat source to correct paths in `output/src-structured/`
 
 Process ONE source file, then output <promise>RESTRUCTURE_PROGRESS</promise>
 When ALL files are done, output <promise>RESTRUCTURE_DONE</promise>
