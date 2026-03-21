@@ -1365,6 +1365,79 @@ When ALL files are done, output <promise>RESTRUCTURE_DONE</promise>
 RESTRUCTURE_EOF
     }
 
+    gen_wiring_prompt() {
+        cat <<'WIRING_EOF'
+You are a software engineer wiring up a restructured codebase so it can actually execute end-to-end.
+
+## Context
+- `output/src-structured/` contains a fully modularized codebase produced by a prior restructuring phase
+- `output/src-structured/PROJECT_META.json` describes the language, runtime, and dependencies
+- `output/src-structured/README.md` documents the architecture
+- `output/src-structured/package.json` (or equivalent manifest) exists but the app cannot yet run
+- The code was decompiled from a compiled binary — all logic is present but the **top-level execution glue** (the main() entrypoint that ties modules together) was lost during decompilation
+
+## Goal
+Create a working entrypoint so the app boots and runs. This is an iterative process:
+1. Analyze → 2. Write entrypoint → 3. Run → 4. Fix errors → repeat until it works
+
+## Job
+
+### Step 1: Analyze the boot sequence
+- Read `PROJECT_META.json` for runtime/language info
+- Read `README.md` for architecture overview and boot sequence docs
+- Find the current `main` field in the manifest (package.json etc.)
+- Trace the startup exports: look for functions/constants named like `main`, `start`, `init`, `bootstrap`, `entrypoint`, `CLI_STARTUP_SEQUENCE`, `HANDLER_EXPORTS`, `MAIN_ENTRY_FAST_PATHS` etc.
+- Map the call graph: which exported functions call which, in what order
+- Identify the dispatch logic: how does the app decide what mode to run (CLI, server, SDK, etc.)
+
+### Step 2: Write the entrypoint
+Create `output/src-structured/main.js` (or appropriate filename) that:
+1. Imports the necessary modules from the structured codebase
+2. Executes the startup sequence in the correct order
+3. Handles command-line arguments and environment variables
+4. Dispatches to the correct handler based on entrypoint determination
+5. Has proper error handling and graceful shutdown
+
+The entrypoint should be minimal glue code — it should CALL the existing functions, not duplicate logic.
+
+### Step 3: Test execution
+Run the entrypoint and capture the output:
+```bash
+node output/src-structured/main.js --version 2>&1
+```
+Start with the simplest possible invocation (--version, --help) before trying full execution.
+
+### Step 4: Fix and iterate
+If execution fails:
+1. Read the error message carefully
+2. Identify the root cause (missing import, wrong call order, missing runtime dependency, etc.)
+3. Fix the entrypoint OR fix the underlying module if needed
+4. Re-run and test again
+
+Common issues to watch for:
+- Circular imports — reorder or lazy-import
+- Missing Bun-specific APIs — polyfill or stub
+- Runtime-only state that needs initialization before use
+- Modules that expect to run in a specific order
+
+### Step 5: Update manifest and docs
+Once execution works:
+1. Update `package.json` (or equivalent) `main` and `scripts.start` to point to the new entrypoint
+2. Update `README.md` with exact build & run instructions
+3. Update `PROJECT_META.json` if you discovered new dependencies or runtime requirements
+
+## Rules
+- Do NOT rewrite existing modules — only create glue code and fix import issues
+- Prefer minimal changes — the restructured code is the source of truth
+- Test incrementally: --version first, then --help, then basic execution
+- Log what you try and what errors you hit so progress is visible
+- If a module needs a small fix (wrong export, missing re-export), fix it in place
+
+Output <promise>WIRING_PROGRESS</promise> after each fix-and-test cycle.
+Output <promise>WIRING_DONE</promise> when the app executes successfully.
+WIRING_EOF
+    }
+
     # Skip straight to main loop with bun_compiled_app mode
     # (Ghidra, discovery, mapping, composition all skipped)
 
@@ -1574,18 +1647,53 @@ if [ -f "$PLAN" ] && ! python3 -c "import json,sys; d=json.load(open('$PLAN')); 
                     RESULT=$(spawn_agent "$RESTRUCTURE_PROMPT" 2>&1)
                     echo "$RESULT" | tee -a "$RECORD_FILE"
 
-                    if echo "$RESULT" | grep -q "RESTRUCTURE_DONE"; then
+                    if grep -q "RESTRUCTURE_DONE" <<< "$RESULT"; then
                         echo ""
                         echo "╔══════════════════════════════════════════════════════════════╗"
                         echo "║  RESTRUCTURE COMPLETE — Project organized!                 ║"
                         echo "╚══════════════════════════════════════════════════════════════╝"
                         break
-                    elif echo "$RESULT" | grep -q "RESTRUCTURE_PROGRESS"; then
+                    elif grep -q "RESTRUCTURE_PROGRESS" <<< "$RESULT"; then
                         echo "... step $RSTEP done, continuing..."
                         continue
                     else
                         echo ""
                         echo "⚠ Restructure step $RSTEP did not signal progress. Retrying..."
+                        continue
+                    fi
+                done
+            fi
+
+            # ── WIRING phase (resume path) ────────────────────────────────
+            if type gen_wiring_prompt &>/dev/null; then
+                echo ""
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo "Phase:  WIRING"
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo ""
+
+                WIRING_PROMPT=$(gen_wiring_prompt)
+                RECORD_FILE="output/records/$(date '+%Y-%m-%d-%H%M%S')-wiring-$TOOL.log"
+                WSTEP=0
+
+                while true; do
+                    WSTEP=$((WSTEP + 1))
+                    echo "======================== WIRING step $WSTEP ($(date '+%Y-%m-%d %H:%M:%S')) ========================" | tee -a "$RECORD_FILE"
+                    RESULT=$(spawn_agent "$WIRING_PROMPT" 2>&1)
+                    echo "$RESULT" | tee -a "$RECORD_FILE"
+
+                    if grep -q "WIRING_DONE" <<< "$RESULT"; then
+                        echo ""
+                        echo "╔══════════════════════════════════════════════════════════════╗"
+                        echo "║  WIRING COMPLETE — App is executable!                      ║"
+                        echo "╚══════════════════════════════════════════════════════════════╝"
+                        break
+                    elif grep -q "WIRING_PROGRESS" <<< "$RESULT"; then
+                        echo "... wiring step $WSTEP done, continuing..."
+                        continue
+                    else
+                        echo ""
+                        echo "⚠ Wiring step $WSTEP did not signal progress. Retrying..."
                         continue
                     fi
                 done
@@ -1684,7 +1792,7 @@ while true; do
         echo "$OUTPUT" | tee -a "$RECORD_FILE"
 
         # Rate limit
-        if echo "$OUTPUT" | grep -qi 'rate.limit\|429\|too many requests\|overloaded'; then
+        if grep -qi 'rate.limit\|429\|too many requests\|overloaded' <<< "$OUTPUT"; then
             echo "Rate limit. Waiting 60s..."
             sleep 60
             ITERATION=$((ITERATION - 1))
@@ -1713,7 +1821,7 @@ if changed:
             echo "All plan tasks complete for cycle $CYCLE."
             break
         fi
-        if echo "$OUTPUT" | tail -30 | grep -q '<promise>CYCLE_DONE</promise>'; then
+        if tail -30 <<< "$OUTPUT" | grep -q '<promise>CYCLE_DONE</promise>'; then
             echo "All plan tasks complete for cycle $CYCLE."
             break
         fi
@@ -1755,18 +1863,53 @@ if changed:
                     RESULT=$(spawn_agent "$RESTRUCTURE_PROMPT" 2>&1)
                     echo "$RESULT" | tee -a "$RECORD_FILE"
 
-                    if echo "$RESULT" | grep -q "RESTRUCTURE_DONE"; then
+                    if grep -q "RESTRUCTURE_DONE" <<< "$RESULT"; then
                         echo ""
                         echo "╔══════════════════════════════════════════════════════════════╗"
                         echo "║  RESTRUCTURE COMPLETE — Project organized!                 ║"
                         echo "╚══════════════════════════════════════════════════════════════╝"
                         break
-                    elif echo "$RESULT" | grep -q "RESTRUCTURE_PROGRESS"; then
+                    elif grep -q "RESTRUCTURE_PROGRESS" <<< "$RESULT"; then
                         echo "... step $RSTEP done, continuing..."
                         continue
                     else
                         echo ""
                         echo "⚠ Restructure step $RSTEP did not signal progress. Retrying..."
+                        continue
+                    fi
+                done
+            fi
+
+            # ── WIRING phase (main loop path) ─────────────────────────────
+            if type gen_wiring_prompt &>/dev/null; then
+                echo ""
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo "Phase:  WIRING"
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo ""
+
+                WIRING_PROMPT=$(gen_wiring_prompt)
+                RECORD_FILE="output/records/$(date '+%Y-%m-%d-%H%M%S')-wiring-$TOOL.log"
+                WSTEP=0
+
+                while true; do
+                    WSTEP=$((WSTEP + 1))
+                    echo "======================== WIRING step $WSTEP ($(date '+%Y-%m-%d %H:%M:%S')) ========================" | tee -a "$RECORD_FILE"
+                    RESULT=$(spawn_agent "$WIRING_PROMPT" 2>&1)
+                    echo "$RESULT" | tee -a "$RECORD_FILE"
+
+                    if grep -q "WIRING_DONE" <<< "$RESULT"; then
+                        echo ""
+                        echo "╔══════════════════════════════════════════════════════════════╗"
+                        echo "║  WIRING COMPLETE — App is executable!                      ║"
+                        echo "╚══════════════════════════════════════════════════════════════╝"
+                        break
+                    elif grep -q "WIRING_PROGRESS" <<< "$RESULT"; then
+                        echo "... wiring step $WSTEP done, continuing..."
+                        continue
+                    else
+                        echo ""
+                        echo "⚠ Wiring step $WSTEP did not signal progress. Retrying..."
                         continue
                     fi
                 done
