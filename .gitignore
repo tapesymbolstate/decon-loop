@@ -1,7 +1,12 @@
-/target-binaries
-/agent-knowledgebase
-/output
-/reference-src
-/tmp
+/target-binaries/*
+!/target-binaries/.gitkeep
+/agent-knowledgebase/*
+!/agent-knowledgebase/.gitkeep
+/output/*
+!/output/.gitkeep
+/reference-src/*
+!/reference-src/.gitkeep
+/tmp/*
+!/tmp/.gitkeep
 __pycache__/
 .claude/
