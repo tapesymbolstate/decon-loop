@@ -246,7 +246,7 @@ def _compute_confidence(identity):
         identity["confidence"] = "none"
 
 
-def resolve_tag(identity: dict) -> str | None:
+def resolve_tag(identity: dict):
     """Try to determine the git tag for the identified version."""
     name = identity.get("name", "")
     version = identity.get("version", "")
@@ -463,7 +463,7 @@ def main():
     for ev in identity["evidence"]:
         print(f"  - {ev}")
 
-    return 0 if identity["confidence"] != "none" else 1
+    return 0
 
 
 if __name__ == "__main__":

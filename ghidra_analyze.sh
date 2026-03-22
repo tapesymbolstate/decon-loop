@@ -13,7 +13,32 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-GHIDRA_HEADLESS="/opt/homebrew/Cellar/ghidra/12.0/libexec/support/analyzeHeadless"
+# Ensure JAVA_HOME is set (nohup/cron don't source ~/.zshrc)
+if ! java -version &>/dev/null; then
+    for jdir in /opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home \
+                /opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home; do
+        if [ -d "$jdir" ]; then
+            export JAVA_HOME="$jdir"
+            export PATH="$JAVA_HOME/bin:$PATH"
+            break
+        fi
+    done
+fi
+
+# Auto-detect Ghidra installation path
+if [ -n "${GHIDRA_HEADLESS:-}" ] && [ -f "$GHIDRA_HEADLESS" ]; then
+    : # Use explicitly set GHIDRA_HEADLESS
+elif command -v analyzeHeadless &>/dev/null; then
+    GHIDRA_HEADLESS="$(command -v analyzeHeadless)"
+else
+    # Search common Homebrew and system locations
+    GHIDRA_HEADLESS=$(find /opt/homebrew/Cellar/ghidra /usr/local/Cellar/ghidra /Applications 2>/dev/null \
+        -name "analyzeHeadless" -type f 2>/dev/null | head -1 || true)
+    if [ -z "$GHIDRA_HEADLESS" ]; then
+        echo "Error: Ghidra analyzeHeadless not found. Install Ghidra or set GHIDRA_HEADLESS env var."
+        exit 1
+    fi
+fi
 SCRIPTS_DIR="$(pwd)/ghidra-scripts"
 PROJECT_DIR="/tmp/ghidra-projects"
 OUTPUT_DIR="$(pwd)/output/ghidra"

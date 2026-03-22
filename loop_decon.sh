@@ -47,6 +47,8 @@ ITERATION=0
 CYCLE=0
 BUILD_ERRORS=""
 ANALYSIS_MODE="full_reconstruction"
+BUNDLED_FORMAT=""        # detected bundled format: bun, node_sea, electron, pyinstaller, ...
+BUNDLED_LANGUAGE=""      # language of the embedded code: javascript, python, etc.
 
 PLAN="output/analysis_plan.json"
 PROGRESS="output/progress.txt"
@@ -726,8 +728,8 @@ measure_coverage() {
 
     local total_mapped lifted_funcs coverage_pct
 
-    if [ "$ANALYSIS_MODE" = "bun_compiled_app" ] && [ -f "$PLAN" ]; then
-        # For bun apps, total = number of tasks in analysis plan
+    if [ "$ANALYSIS_MODE" = "bundled_app" ] && [ -f "$PLAN" ]; then
+        # For bundled apps, total = number of tasks in analysis plan
         total_mapped=$(python3 -c "import json; d=json.load(open('$PLAN')); print(len(d.get('userStories', [])))" 2>/dev/null || echo 0)
     elif [ "$ANALYSIS_MODE" = "custom_extraction" ] && [ -f "output/composition/analysis.json" ]; then
         total_mapped=$(python3 -c "import json; d=json.load(open('output/composition/analysis.json')); print(d.get('analysis_target_count', 0))" 2>/dev/null)
@@ -743,7 +745,7 @@ measure_coverage() {
     lifted_funcs=0
     if find output/src -name '*.cpp' -o -name '*.c' 2>/dev/null | grep -q .; then
         local c_funcs
-        c_funcs=$(find output/src \( -name '*.cpp' -o -name '*.c' \) -exec grep -cE '^[a-zA-Z_].*\(.*\)\s*\{' {} \; 2>/dev/null | awk '{s+=$1}END{print s+0}')
+        c_funcs=$(find output/src \( -name '*.cpp' -o -name '*.c' -o -name '*.h' \) -exec grep -cE '^(static\s+)?(const\s+)?(unsigned\s+)?(struct\s+)?[a-zA-Z_]\w*[\w *]+\w+\s*\([^;]*\)\s*\{?$' {} \; 2>/dev/null | awk '{s+=$1}END{print s+0}')
         lifted_funcs=$((lifted_funcs + c_funcs))
     fi
     if find output/src -name '*.zig' 2>/dev/null | grep -q .; then
@@ -758,8 +760,8 @@ measure_coverage() {
         lifted_funcs=$((lifted_funcs + js_funcs))
     fi
 
-    # For bun_compiled_app, count completed tasks instead of function defs
-    if [ "$ANALYSIS_MODE" = "bun_compiled_app" ] && [ -f "$PLAN" ]; then
+    # For bundled_app, count completed tasks instead of function defs
+    if [ "$ANALYSIS_MODE" = "bundled_app" ] && [ -f "$PLAN" ]; then
         lifted_funcs=$(python3 -c "import json; d=json.load(open('$PLAN')); print(sum(1 for s in d.get('userStories', []) if s.get('passes')))" 2>/dev/null || echo 0)
     fi
 
@@ -823,7 +825,7 @@ verify_build() {
     # C/C++ functions
     if find output/src -name '*.cpp' -o -name '*.c' 2>/dev/null | grep -q .; then
         local c_funcs
-        c_funcs=$(find output/src \( -name '*.cpp' -o -name '*.c' \) -exec grep -cE '^[a-zA-Z_].*\(.*\)\s*\{' {} \; 2>/dev/null | awk '{s+=$1}END{print s+0}')
+        c_funcs=$(find output/src \( -name '*.cpp' -o -name '*.c' -o -name '*.h' \) -exec grep -cE '^(static\s+)?(const\s+)?(unsigned\s+)?(struct\s+)?[a-zA-Z_]\w*[\w *]+\w+\s*\([^;]*\)\s*\{?$' {} \; 2>/dev/null | awk '{s+=$1}END{print s+0}')
         func_defs=$((func_defs + c_funcs))
     fi
     # Zig functions
@@ -874,14 +876,58 @@ verify_build() {
 
     # JavaScript syntax check (node --check)
     if find output/src -name '*.js' 2>/dev/null | grep -q .; then
-        while IFS= read -r srcfile; do
-            file_errors=$(node --check "$srcfile" 2>&1)
+        if command -v node &>/dev/null; then
+            while IFS= read -r srcfile; do
+                file_errors=$(node --check "$srcfile" 2>&1)
+                file_rc=$?
+                if [ "$file_rc" -ne 0 ]; then
+                    compile_rc=$file_rc
+                    errors="${errors}${srcfile}: ${file_errors}\n"
+                fi
+            done < <(find output/src -name '*.js')
+        else
+            echo "  Warning: node not found, skipping JS syntax check"
+        fi
+    fi
+
+    # Python syntax check (py_compile)
+    if find output/src -name '*.py' 2>/dev/null | grep -q .; then
+        if command -v python3 &>/dev/null; then
+            while IFS= read -r srcfile; do
+                file_errors=$(python3 -m py_compile "$srcfile" 2>&1)
+                file_rc=$?
+                if [ "$file_rc" -ne 0 ]; then
+                    compile_rc=$file_rc
+                    errors="${errors}${srcfile}: ${file_errors}\n"
+                fi
+            done < <(find output/src -name '*.py')
+        fi
+    fi
+
+    # Go syntax check (go vet)
+    if find output/src -name '*.go' 2>/dev/null | grep -q .; then
+        if command -v go &>/dev/null; then
+            file_errors=$(cd output/src && go vet ./... 2>&1)
             file_rc=$?
             if [ "$file_rc" -ne 0 ]; then
                 compile_rc=$file_rc
-                errors="${errors}${srcfile}: ${file_errors}\n"
+                errors="${errors}Go vet: ${file_errors}\n"
             fi
-        done < <(find output/src -name '*.js')
+        fi
+    fi
+
+    # Rust syntax check (rustc --edition 2021)
+    if find output/src -name '*.rs' 2>/dev/null | grep -q .; then
+        if command -v rustc &>/dev/null; then
+            while IFS= read -r srcfile; do
+                file_errors=$(rustc --edition 2021 --crate-type lib "$srcfile" -o /dev/null 2>&1)
+                file_rc=$?
+                if [ "$file_rc" -ne 0 ]; then
+                    compile_rc=$file_rc
+                    errors="${errors}${srcfile}: ${file_errors}\n"
+                fi
+            done < <(find output/src -name '*.rs')
+        fi
     fi
 
     if [ "$compile_rc" -ne 0 ] || [ -n "$errors" ]; then
@@ -896,24 +942,53 @@ verify_build() {
     return 0
 }
 
-# ─── Phase -1: Detect bun build --compile binaries ───────────────────────────
-
-IS_BUN_COMPILED=false
+# ─── Phase -1: Detect bundled-app binaries ────────────────────────────────────
+# Checks for binaries that embed application source code (JS, Python, etc.)
+# in a special segment or appended payload. Each format has its own extractor.
 
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║  BINARY FORMAT DETECTION                                    ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
 
+# ── Detect bundled format ──────────────────────────────────────────────────
 if otool -l "$BINARY_PATH" 2>/dev/null | grep -q "__BUN"; then
-    IS_BUN_COMPILED=true
-    echo ">>> Detected: bun build --compile artifact (found __BUN segment)"
+    BUNDLED_FORMAT="bun"
+    BUNDLED_LANGUAGE="javascript"
+    echo ">>> Detected: Bun compiled app (found __BUN Mach-O segment)"
+elif strings "$BINARY_PATH" 2>/dev/null | grep -qE 'NODE_SEA_BLOB|NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2'; then
+    BUNDLED_FORMAT="node_sea"
+    BUNDLED_LANGUAGE="javascript"
+    echo ">>> Detected: Node.js Single Executable Application (SEA)"
+elif strings "$BINARY_PATH" 2>/dev/null | grep -qE 'electron\.asar|ELECTRON_RUN_AS_NODE'; then
+    BUNDLED_FORMAT="electron"
+    BUNDLED_LANGUAGE="javascript"
+    echo ">>> Detected: Electron application"
+elif strings "$BINARY_PATH" 2>/dev/null | grep -qE '_MEIPASS|pyiboot|PyInstaller'; then
+    BUNDLED_FORMAT="pyinstaller"
+    BUNDLED_LANGUAGE="python"
+    echo ">>> Detected: PyInstaller bundled Python application"
+elif strings "$BINARY_PATH" 2>/dev/null | grep -qE 'pkg/prelude|pkg\.js\.snapshot'; then
+    BUNDLED_FORMAT="pkg"
+    BUNDLED_LANGUAGE="javascript"
+    echo ">>> Detected: Vercel pkg bundled Node.js application"
+else
+    echo ">>> No bundled-app format detected. Proceeding with native binary pipeline."
+fi
+echo ""
+
+if [ -n "$BUNDLED_FORMAT" ]; then
+    echo "  Format:   $BUNDLED_FORMAT"
+    echo "  Language: $BUNDLED_LANGUAGE"
     echo ""
 
     mkdir -p output/bundled_app output/src
 
-    if [ ! -f "output/bundled_app/app_bundle.js" ]; then
-        echo "Extracting embedded application code from __BUN section..."
+    # ── Format-specific extraction ─────────────────────────────────────────
+    if [ ! -f "output/bundled_app/app_bundle_extracted" ]; then
+
+    if [ "$BUNDLED_FORMAT" = "bun" ]; then
+        echo "Extracting embedded application code from __BUN Mach-O segment..."
 
         BINARY_PATH="$BINARY_PATH" python3 <<'BUN_EXTRACT_PY'
 import struct, re, os, json
@@ -988,7 +1063,7 @@ with open(binary, 'rb') as f:
 
             # Detect app identity
             all_app = '\n'.join(app_segments[:5])
-            app_info = {'format': 'bun_compiled', 'bun_section_size': bun_size}
+            app_info = {'format': 'bun', 'bundled_language': 'javascript', 'bun_section_size': bun_size}
 
             # Look for version, name, copyright
             ver_match = re.search(r'Version:\s*([0-9]+\.[0-9]+\.[0-9]+)', all_app)
@@ -1020,20 +1095,52 @@ with open(binary, 'rb') as f:
         print("  Warning: Not a 64-bit Mach-O, skipping __BUN extraction")
 BUN_EXTRACT_PY
 
+        touch output/bundled_app/app_bundle_extracted
+
+    elif [ "$BUNDLED_FORMAT" = "node_sea" ]; then
+        echo "Node.js SEA extraction — using postject/node sentinel detection..."
+        echo "  (Extractor not yet implemented — the AI agent will analyze the binary directly)"
+        # TODO: extract embedded blob via NODE_SEA_BLOB sentinel
+        touch output/bundled_app/app_bundle_extracted
+
+    elif [ "$BUNDLED_FORMAT" = "electron" ]; then
+        echo "Electron app — extracting asar archive..."
+        echo "  (Extractor not yet implemented — the AI agent will analyze the binary directly)"
+        # TODO: locate and extract .asar from Electron bundle
+        touch output/bundled_app/app_bundle_extracted
+
+    elif [ "$BUNDLED_FORMAT" = "pyinstaller" ]; then
+        echo "PyInstaller bundle — extracting Python bytecode..."
+        echo "  (Extractor not yet implemented — the AI agent will analyze the binary directly)"
+        # TODO: use pyinstxtractor or equivalent
+        touch output/bundled_app/app_bundle_extracted
+
+    elif [ "$BUNDLED_FORMAT" = "pkg" ]; then
+        echo "Vercel pkg bundle — extracting snapshot..."
+        echo "  (Extractor not yet implemented — the AI agent will analyze the binary directly)"
+        # TODO: extract pkg snapshot blob
+        touch output/bundled_app/app_bundle_extracted
+
     else
-        echo "App bundle already extracted. Skipping."
+        echo "  Warning: format '$BUNDLED_FORMAT' detected but no extractor available."
+        touch output/bundled_app/app_bundle_extracted
+    fi
+
+    else
+        echo "Bundled app already extracted. Skipping."
         cat output/bundled_app/app_info.json 2>/dev/null | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
 print(f'  App: {d.get(\"app_name\",\"unknown\")} v{d.get(\"app_version\",\"?\")}')
-print(f'  __BUN size: {d.get(\"bun_section_size\",0):,} bytes')
+fmt=d.get('format','unknown')
+print(f'  Format: {fmt}')
 " 2>/dev/null
     fi
 
     echo ""
 
-    # ─── Phase A: Auto-beautify with js-beautify ─────────────────────────────
-    if [ -f "output/bundled_app/app_bundle.js" ] && [ ! -f "output/bundled_app/app_beautified.js" ]; then
+    # ─── Phase A: Auto-beautify (language-specific formatters) ───────────────
+    if [ "$BUNDLED_LANGUAGE" = "javascript" ] && [ -f "output/bundled_app/app_bundle.js" ] && [ ! -f "output/bundled_app/app_beautified.js" ]; then
         echo "╔══════════════════════════════════════════════════════════════╗"
         echo "║  PHASE A: AUTO-BEAUTIFY (js-beautify)                      ║"
         echo "╚══════════════════════════════════════════════════════════════╝"
@@ -1055,6 +1162,9 @@ print(f'  __BUN size: {d.get(\"bun_section_size\",0):,} bytes')
             echo "  Warning: js-beautify failed, falling back to raw bundle"
             cp output/bundled_app/app_bundle.js output/bundled_app/app_beautified.js
         fi
+        echo ""
+    elif [ "$BUNDLED_LANGUAGE" = "python" ]; then
+        echo "  Python bundle — beautification handled by the AI agent during analysis."
         echo ""
     fi
 
@@ -1111,7 +1221,7 @@ for idx in range(len(breakpoints) - 1):
     strings = re.findall(r'"([^"]{10,80})"', content)
     errors = [s for s in strings if 'error' in s.lower() or 'fail' in s.lower() or 'invalid' in s.lower()]
     urls = [s for s in strings if '/' in s and ('http' in s or 'api' in s or 'oauth' in s)]
-    keywords = [s for s in strings if any(k in s.lower() for k in ['claude', 'anthropic', 'mcp', 'tool', 'permission', 'session', 'message'])]
+    keywords = [s for s in strings if any(k in s.lower() for k in ['config', 'init', 'handler', 'route', 'service', 'model', 'auth', 'server', 'client'])]
 
     chunks_meta.append({
         'file': chunk_name,
@@ -1142,40 +1252,51 @@ CHUNK_PY
     fi
 
     echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║  MODE: BUN COMPILED APP — skipping Ghidra, extracting JS     ║"
+    echo "║  MODE: BUNDLED APP — extracting embedded $BUNDLED_LANGUAGE source  ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo ""
-    echo "The application logic is embedded JavaScript, not native code."
+    echo "The application logic is embedded $BUNDLED_LANGUAGE (format: $BUNDLED_FORMAT)."
     echo "Ghidra decompilation is not needed for app logic extraction."
     echo ""
 
-    # Generate an analysis plan for the AI agent to analyze the extracted JS
-    ANALYSIS_MODE="bun_compiled_app"
+    # Set analysis mode for the main loop dispatch
+    ANALYSIS_MODE="bundled_app"
 
-    gen_bun_app_plan_prompt() {
-        # Build actual chunk file list for the prompt
-        local chunk_list
-        chunk_list=$(ls output/bundled_app/chunks/chunk_*.js 2>/dev/null | head -5 | tr '\n' ', ')
+    gen_bundled_app_plan_prompt() {
+        # Determine file extension for the target source files
+        local src_ext=".js"
+        case "$BUNDLED_LANGUAGE" in
+            python) src_ext=".py" ;;
+            javascript) src_ext=".js" ;;
+            typescript) src_ext=".ts" ;;
+            *) src_ext=".txt" ;;
+        esac
 
-        cat <<BUN_PLAN_EOF
-You are a source code analyst. A \`bun build --compile\` binary has been extracted.
+        cat <<BUNDLED_PLAN_EOF
+You are a source code analyst. A bundled application binary has been detected and extracted.
+
+## Binary info
+- Format: $BUNDLED_FORMAT
+- Embedded language: $BUNDLED_LANGUAGE
+- Binary path: \`$BINARY_PATH\`
 
 ## Data
-- \`output/bundled_app/app_info.json\` — app metadata
-- \`output/bundled_app/chunks/\` — beautified JS code split into ~400-line chunks
-- Chunk filenames follow the pattern: \`chunk_NNN_LSTART-LEND.js\` (e.g. \`chunk_000_L1-L635.js\`)
+- \`output/bundled_app/app_info.json\` — app metadata (format, version, etc.)
+- \`output/bundled_app/chunks/\` — extracted source split into ~400-line chunks (if extraction succeeded)
+- \`output/bundled_app/\` — raw extracted files (app_bundle*, etc.)
+- Chunk filenames follow the pattern: \`chunk_NNN_LSTART-LEND${src_ext}\`
 
 ## Job
 1. Read \`output/bundled_app/app_info.json\`
-2. Run \`ls output/bundled_app/chunks/ | wc -l\` to see how many chunks exist
-3. Run \`ls output/bundled_app/chunks/\` to get the EXACT filenames
-4. Sample chunks at intervals (chunk_000, chunk_050, chunk_100, chunk_200, chunk_400, chunk_600) — read first 30 lines of each
-5. Group chunks into 15-25 modules by purpose, create \`output/analysis_plan.json\`:
+2. Run \`ls output/bundled_app/\` and \`ls output/bundled_app/chunks/ 2>/dev/null\` to see what was extracted
+3. If chunks exist, sample at intervals (chunk_000, chunk_050, chunk_100, etc.) — read first 30 lines of each
+4. If no chunks exist, read the raw extracted files to understand the embedded code
+5. Group the code into 15-25 modules by purpose, create \`output/analysis_plan.json\`:
    \`\`\`json
-   { "binaryTarget": "$BINARY_PATH", "analysisMode": "bun_compiled_app", "cycle": 1,
+   { "binaryTarget": "$BINARY_PATH", "analysisMode": "bundled_app", "bundledFormat": "$BUNDLED_FORMAT", "cycle": 1,
      "userStories": [{ "id": "US-001", "title": "Module name",
        "chunkRange": { "start": 0, "end": 24 },
-       "targetSourceFile": "output/src/module_name.js",
+       "targetSourceFile": "output/src/module_name${src_ext}",
        "priority": 1, "passes": false }] }
    \`\`\`
 
@@ -1187,12 +1308,16 @@ You are a source code analyst. A \`bun build --compile\` binary has been extract
 Keep analysis_plan.json under 30KB. 15-25 tasks max. Group adjacent chunks into modules.
 
 When done: <promise>PLAN_COMPLETE</promise>
-BUN_PLAN_EOF
+BUNDLED_PLAN_EOF
     }
 
-    gen_bun_app_build_prompt() {
-        cat <<BUN_BUILD_EOF
-You are a JavaScript deobfuscator. Read beautified-but-mangled JS chunks and rewrite them with meaningful names.
+    gen_bundled_app_build_prompt() {
+        cat <<BUNDLED_BUILD_EOF
+You are a source code deobfuscator and reconstructor. Read extracted and chunked source code from a bundled application binary and rewrite it into clean, readable modules.
+
+## Binary info
+- Format: $BUNDLED_FORMAT
+- Embedded language: $BUNDLED_LANGUAGE
 
 ## Context
 1. \`output/analysis_plan.json\` — task list with \`chunkRange\` per task
@@ -1202,37 +1327,40 @@ You are a JavaScript deobfuscator. Read beautified-but-mangled JS chunks and rew
 Each task has a \`chunkRange\` field like \`{"start": 0, "end": 24}\`.
 To find the actual files, run:
 \`\`\`
-ls output/bundled_app/chunks/chunk_0{00..24}_*.js
+ls output/bundled_app/chunks/ | sort | head -30
 \`\`\`
-Or more reliably:
+Then filter for your range:
 \`\`\`
 ls output/bundled_app/chunks/ | grep -E '^chunk_0(0[0-9]|1[0-9]|2[0-4])_' | head
 \`\`\`
-Each chunk file is named like \`chunk_NNN_LSTART-LEND.js\`.
 
 ## Job
 1. Pick the first task in \`output/analysis_plan.json\` where \`passes\` is \`false\`
 2. Resolve the chunk files from its \`chunkRange\` (see above)
-3. Read the chunk files for this task (cat or read each one)
-4. Rewrite the code into a clean JavaScript module:
-   - Rename ALL mangled identifiers (variables, functions, parameters, class names) at their DECLARATION site
-   - Every reference to a renamed symbol must also be updated — if you rename \`kFT\` to \`treeifyError\` in its declaration, every usage of \`kFT\` in the file must become \`treeifyError\`
-   - Do NOT leave any mangled names as values in export objects or property assignments — the value side must match the renamed declaration
-   - Use string literals, error messages, property names, API URLs, and call-site context as clues for naming
-   - Replace \`!0\` with \`true\`, \`!1\` with \`false\`, \`void 0\` with \`undefined\`
+3. Read the chunk files for this task
+4. Rewrite the code into a clean, readable module:
+   - Rename ALL mangled/obfuscated identifiers to meaningful names at their DECLARATION site
+   - Every reference to a renamed symbol must also be updated consistently
+   - Use string literals, error messages, property names, URLs, and call-site context as naming clues
+   - Apply language-specific deobfuscation (e.g., for JS: \`!0\` → \`true\`, \`!1\` → \`false\`, \`void 0\` → \`undefined\`)
    - Add brief comments only for non-obvious logic
    - Preserve all logic exactly — do NOT change behavior
-   - Output valid JavaScript (ES module style where applicable)
+   - Output valid, idiomatic $BUNDLED_LANGUAGE code
 5. Write to the task's \`targetSourceFile\` path (\`mkdir -p output/src\` first)
 6. Append discovered name mappings to \`output/progress.txt\`
 7. Update \`output/analysis_plan.json\`: set this task's \`passes\` to \`true\`
 
 ONE task per iteration. When ALL tasks have \`passes: true\`, output: <promise>CYCLE_DONE</promise>
-BUN_BUILD_EOF
+BUNDLED_BUILD_EOF
     }
 
-    gen_restructure_prompt() {
-        cat <<'RESTRUCTURE_EOF'
+    # (gen_restructure_prompt and gen_wiring_prompt are defined after the fi block
+    #  so they are available for ALL binary types, not just bundled apps)
+
+    _placeholder_restructure_removed=1  # functions moved below fi
+
+gen_restructure_prompt() {
+    cat <<'RESTRUCTURE_EOF'
 You are a software project architect. Read deobfuscated flat source files and rewrite them into a clean, human-manageable, RE-EXECUTABLE project.
 
 ## Input (READ-ONLY — do NOT modify these)
@@ -1253,16 +1381,15 @@ Before processing any files, inspect `output/src/` to determine:
 Write your findings to `output/src-structured/PROJECT_META.json`:
 ```json
 {
-  "language": "javascript",
-  "moduleSystem": "esm",
-  "runtime": "node",
-  "fileExtension": ".js",
-  "syntaxCheckCommand": "node --check",
-  "buildTool": "npm",
-  "manifestFile": "package.json",
+  "language": "<detected language: javascript, python, go, rust, c, cpp, zig, etc.>",
+  "moduleSystem": "<detected module system: esm, commonjs, go_packages, rust_mod, python_import, c_include, etc.>",
+  "runtime": "<detected runtime: node, bun, deno, cpython, go, rustc, gcc, zig, etc.>",
+  "fileExtension": "<.js, .py, .go, .rs, .c, .cpp, .zig, etc.>",
+  "syntaxCheckCommand": "<language-appropriate: node --check, python -m py_compile, go vet, rustc --edition 2021, zig ast-check, gcc -fsyntax-only, etc.>",
+  "buildTool": "<npm, pip, go, cargo, make, zig, cmake, etc.>",
+  "manifestFile": "<package.json, pyproject.toml, go.mod, Cargo.toml, CMakeLists.txt, build.zig, etc.>",
   "externalDependencies": {
-    "react": { "hint": ">=18.0.0", "evidence": "uses createRoot, concurrent features" },
-    "zod": { "hint": ">=3.22.0", "evidence": "z.pipe() usage found" }
+    "<dependency_name>": { "hint": "<version_range>", "evidence": "<why this version>" }
   }
 }
 ```
@@ -1277,7 +1404,7 @@ Sources of version evidence (check in order):
 2. **API surface**: newer APIs narrow the minimum version (e.g. `z.pipe()` → zod >=3.22, `createRoot` → react >=18)
 3. **Import paths**: deep imports like `@aws-sdk/client-bedrock-runtime` indicate SDK v3+
 4. **String literals**: error messages, user-agent strings, changelog references
-5. **Registry lookup by build date**: if no direct evidence is found, determine the binary's build date (from embedded timestamps, version strings, file metadata, etc.) and query the package registry (npm, crates.io, PyPI, etc.) to find the latest version of each dependency that was available at that build date. Use `curl` or equivalent to check the registry API. For example, for npm: `curl -s https://registry.npmjs.org/<pkg> | jq '.time'` gives publish dates for all versions — pick the latest one published before the binary's build date. Record the build date in PROJECT_META.json as `"buildDate"` so this only needs to be determined once.
+5. **Registry lookup by build date**: if no direct evidence is found, determine the binary's build date (from embedded timestamps, version strings, file metadata, etc.) and query the appropriate package registry to find the latest version available at that build date. Record the build date in PROJECT_META.json as `"buildDate"` so this only needs to be determined once.
 
 Update `externalDependencies` in PROJECT_META.json incrementally as you process each source file — new imports may appear in later files that refine earlier guesses.
 
@@ -1365,8 +1492,8 @@ When ALL files are done, output <promise>RESTRUCTURE_DONE</promise>
 RESTRUCTURE_EOF
     }
 
-    gen_wiring_prompt() {
-        cat <<'WIRING_EOF'
+gen_wiring_prompt() {
+    cat <<'WIRING_EOF'
 You are a software engineer wiring up a restructured codebase so it can actually execute end-to-end.
 
 ## Context
@@ -1391,7 +1518,7 @@ Create a working entrypoint so the app boots and runs. This is an iterative proc
 - Identify the dispatch logic: how does the app decide what mode to run (CLI, server, SDK, etc.)
 
 ### Step 2: Write the entrypoint
-Create `output/src-structured/main.js` (or appropriate filename) that:
+Create the appropriate entrypoint file (e.g., `main.js`, `main.py`, `main.go`, `main.rs` — based on PROJECT_META.json language) that:
 1. Imports the necessary modules from the structured codebase
 2. Executes the startup sequence in the correct order
 3. Handles command-line arguments and environment variables
@@ -1401,9 +1528,10 @@ Create `output/src-structured/main.js` (or appropriate filename) that:
 The entrypoint should be minimal glue code — it should CALL the existing functions, not duplicate logic.
 
 ### Step 3: Test execution
-Run the entrypoint and capture the output:
+Run the entrypoint using the runtime from PROJECT_META.json and capture the output:
 ```bash
-node output/src-structured/main.js --version 2>&1
+# Use the syntaxCheckCommand / runtime from PROJECT_META.json, e.g.:
+<runtime> output/src-structured/<entrypoint> --version 2>&1
 ```
 Start with the simplest possible invocation (--version, --help) before trying full execution.
 
@@ -1416,13 +1544,13 @@ If execution fails:
 
 Common issues to watch for:
 - Circular imports — reorder or lazy-import
-- Missing Bun-specific APIs — polyfill or stub
+- Missing runtime-specific APIs — polyfill or stub as needed
 - Runtime-only state that needs initialization before use
 - Modules that expect to run in a specific order
 
 ### Step 5: Update manifest and docs
 Once execution works:
-1. Update `package.json` (or equivalent) `main` and `scripts.start` to point to the new entrypoint
+1. Update the build manifest (package.json, Cargo.toml, go.mod, etc.) to point to the new entrypoint
 2. Update `README.md` with exact build & run instructions
 3. Update `PROJECT_META.json` if you discovered new dependencies or runtime requirements
 
@@ -1438,17 +1566,19 @@ Output <promise>WIRING_DONE</promise> when the app executes successfully.
 WIRING_EOF
     }
 
-    # Skip straight to main loop with bun_compiled_app mode
+    # Skip straight to main loop with bundled_app mode
     # (Ghidra, discovery, mapping, composition all skipped)
 
 else
-    echo ">>> Standard binary (no __BUN segment). Proceeding with Ghidra pipeline."
+    echo ">>> Standard native binary. Proceeding with Ghidra pipeline."
     echo ""
 fi
 
-# ─── Phase 0: Ghidra pre-analysis (run once, skip if bun compiled app) ────────
+# ─── Define restructure & wiring prompts (available for ALL binary types) ─────
 
-if [ "$IS_BUN_COMPILED" = false ]; then
+# ─── Phase 0: Ghidra pre-analysis (run once, skip if bundled app) ─────────────
+
+if [ -z "$BUNDLED_FORMAT" ]; then
 
 mkdir -p /tmp/ghidra-projects output/ghidra
 
@@ -1613,7 +1743,7 @@ print(f\"Recommended mode: {d['mode']}\")
     echo ""
 fi
 
-fi  # end IS_BUN_COMPILED=false (Ghidra + discovery + mapping + composition)
+fi  # end native binary path (Ghidra + discovery + mapping + composition)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN LOOP: Plan → Build → Verify → Re-plan if needed
@@ -1630,7 +1760,7 @@ if [ -f "$PLAN" ] && ! python3 -c "import json,sys; d=json.load(open('$PLAN')); 
             echo "Coverage target already met ($COVERAGE_PCT%)."
 
             # ── RESTRUCTURE phase (resume path) ───────────────────────────
-            if [ "$ANALYSIS_MODE" = "bun_compiled_app" ] && type gen_restructure_prompt &>/dev/null; then
+            if type gen_restructure_prompt &>/dev/null; then
                 echo ""
                 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                 echo "Phase:  RESTRUCTURE"
@@ -1728,9 +1858,9 @@ while true; do
         echo "Mode:   $ANALYSIS_MODE"
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-        if [ "$ANALYSIS_MODE" = "bun_compiled_app" ]; then
-            echo "(Bun compiled app — extracting and de-minifying JS application code)"
-            PLAN_PROMPT=$(gen_bun_app_plan_prompt)
+        if [ "$ANALYSIS_MODE" = "bundled_app" ]; then
+            echo "(Bundled app [$BUNDLED_FORMAT] — extracting and deobfuscating $BUNDLED_LANGUAGE code)"
+            PLAN_PROMPT=$(gen_bundled_app_plan_prompt)
         elif [ "$ANALYSIS_MODE" = "custom_extraction" ]; then
             echo "(Custom extraction mode — focusing on unique application logic)"
             PLAN_PROMPT=$(gen_custom_plan_prompt "$CYCLE" "$BUILD_ERRORS")
@@ -1769,8 +1899,8 @@ while true; do
     [ "$MAX_ITERATIONS" -gt 0 ] && echo "Max:    $MAX_ITERATIONS total iterations"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    if [ "$ANALYSIS_MODE" = "bun_compiled_app" ]; then
-        BUILD_PROMPT=$(gen_bun_app_build_prompt)
+    if [ "$ANALYSIS_MODE" = "bundled_app" ]; then
+        BUILD_PROMPT=$(gen_bundled_app_build_prompt)
     elif [ "$ANALYSIS_MODE" = "custom_extraction" ]; then
         BUILD_PROMPT=$(gen_custom_build_prompt)
     else
@@ -1848,7 +1978,7 @@ if changed:
             echo ""
 
             # ── RESTRUCTURE phase ──────────────────────────────────────────
-            if [ "$ANALYSIS_MODE" = "bun_compiled_app" ] && type gen_restructure_prompt &>/dev/null; then
+            if type gen_restructure_prompt &>/dev/null; then
                 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                 echo "Phase:  RESTRUCTURE"
                 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

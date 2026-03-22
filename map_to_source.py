@@ -91,7 +91,7 @@ def build_source_function_index(source_dir: str) -> dict[str, list[tuple[str, in
     for ext, pattern in patterns.items():
         for fpath in source_path.rglob(f"*{ext}"):
             rel_path = str(fpath.relative_to(source_path))
-            if any(skip in rel_path for skip in ["vendor/", "node_modules/", "test/", "bench/"]):
+            if any(skip in rel_path for skip in ["vendor/", "node_modules/", "third_party/", "deps/", "external/", "test/", "bench/"]):
                 continue
             try:
                 content = fpath.read_text(errors="replace")
@@ -146,7 +146,7 @@ def build_source_string_index(source_dir: str) -> dict[str, list[tuple[str, int]
     for ext in (".zig", ".cpp", ".c", ".h", ".rs", ".go", ".swift"):
         for fpath in source_path.rglob(f"*{ext}"):
             rel = str(fpath.relative_to(source_path))
-            if any(skip in rel for skip in ["vendor/", "node_modules/", "test/"]):
+            if any(skip in rel for skip in ["vendor/", "node_modules/", "third_party/", "deps/", "external/", "test/"]):
                 continue
             try:
                 for i, line in enumerate(fpath.read_text(errors="replace").splitlines(), 1):

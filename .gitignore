@@ -1,5 +1,7 @@
 /target-binaries/*
 !/target-binaries/.gitkeep
+/target-binaries-candidates/*
+!/target-binaries-candidates/.gitkeep
 /agent-knowledgebase/*
 !/agent-knowledgebase/.gitkeep
 /output/*
