@@ -1480,7 +1480,9 @@ After the last source file is processed:
 3. Verify: syntax check all files, imports/includes resolve correctly
 
 ### Domain directories
-Create directories as needed based on the code's actual domain structure. Common patterns:
+Classify code by its FUNCTIONAL DOMAIN — what it actually does — NOT by the source filename. Source filenames are artifacts of bundling/deobfuscation and have no architectural meaning.
+
+Create directories based on the code's actual domain structure. Common patterns:
 `core/`, `api/`, `auth/`, `cli/`, `config/`, `tools/`, `ui/`, `plugins/`, `providers/`, `security/`, `telemetry/`, `remote/`, `validation/`, `parsers/`, `sessions/`, `net/`, `storage/`
 
 Use whatever makes sense for the specific codebase — these are suggestions, not requirements.
