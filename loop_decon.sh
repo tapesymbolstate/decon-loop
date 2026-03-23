@@ -55,8 +55,13 @@ PROGRESS="output/progress.txt"
 
 # ─── Records setup ───────────────────────────────────────────────────────────
 
-mkdir -p output/records
-RECORD_FILE="output/records/$(date '+%Y-%m-%d-%H%M%S')-decon-$TOOL.log"
+RECORDS_DIR="output/records"
+mkdir -p "$RECORDS_DIR"
+if [ ! -f "$RECORDS_DIR/.gitignore" ]; then
+    printf '*\n!.gitignore\n' > "$RECORDS_DIR/.gitignore"
+fi
+RECORD_FILE="$RECORDS_DIR/$(date '+%Y-%m-%d-%H%M%S')-decon-$TOOL.jsonl"
+echo "Record: $RECORD_FILE"
 
 # ─── Prompt: initial plan (cycle 1) ─────────────────────────────────────────
 
@@ -706,6 +711,7 @@ spawn_agent() {
         [ "$TOOL" = "codex-spark" ] && model="gpt-5.3-codex-spark"
         echo "$prompt" | codex exec \
             --full-auto \
+            --json \
             --model "$model" \
             2>&1 || true
     else
@@ -714,6 +720,7 @@ spawn_agent() {
             --effort "${CLAUDE_EFFORT:-max}" \
             --permission-mode bypassPermissions \
             --dangerously-skip-permissions \
+            --output-format=stream-json \
             "$prompt" \
             2>&1 || true
     fi
@@ -1768,7 +1775,7 @@ if [ -f "$PLAN" ] && ! python3 -c "import json,sys; d=json.load(open('$PLAN')); 
                 echo ""
 
                 RESTRUCTURE_PROMPT=$(gen_restructure_prompt)
-                RECORD_FILE="output/records/$(date '+%Y-%m-%d-%H%M%S')-restructure-$TOOL.log"
+                RECORD_FILE="$RECORDS_DIR/$(date '+%Y-%m-%d-%H%M%S')-restructure-$TOOL.jsonl"
                 RSTEP=0
 
                 while true; do
@@ -1803,7 +1810,7 @@ if [ -f "$PLAN" ] && ! python3 -c "import json,sys; d=json.load(open('$PLAN')); 
                 echo ""
 
                 WIRING_PROMPT=$(gen_wiring_prompt)
-                RECORD_FILE="output/records/$(date '+%Y-%m-%d-%H%M%S')-wiring-$TOOL.log"
+                RECORD_FILE="$RECORDS_DIR/$(date '+%Y-%m-%d-%H%M%S')-wiring-$TOOL.jsonl"
                 WSTEP=0
 
                 while true; do
@@ -2019,7 +2026,7 @@ if changed:
                 echo ""
 
                 WIRING_PROMPT=$(gen_wiring_prompt)
-                RECORD_FILE="output/records/$(date '+%Y-%m-%d-%H%M%S')-wiring-$TOOL.log"
+                RECORD_FILE="$RECORDS_DIR/$(date '+%Y-%m-%d-%H%M%S')-wiring-$TOOL.jsonl"
                 WSTEP=0
 
                 while true; do
