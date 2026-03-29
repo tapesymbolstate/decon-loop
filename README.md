@@ -1,4 +1,6 @@
-# Decon Agent v2
+# Decon Agent
+
+> **decon** — short for *deconstruction*. This tool deconstructs compiled binaries back into readable, buildable source code.
 
 Autonomous binary decompilation pipeline that reconstructs buildable source code from compiled binaries. Uses AI agents (Claude or OpenAI Codex) in an iterative loop to plan, lift, and verify decompiled source until it compiles cleanly.
 
