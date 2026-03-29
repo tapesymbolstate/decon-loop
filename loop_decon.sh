@@ -1,5 +1,5 @@
 #!/bin/bash
-# Decon Agent — Binary Decompilation via Ralph Loop
+# Decon Loop — Binary Decompilation via Ralph Loop
 #
 # Usage: ./loop_decon.sh <binary_path> [codex|codex-spark|claude] [max_iterations]
 #

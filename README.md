@@ -1,4 +1,4 @@
-# Decon Agent
+# Decon Loop
 
 > **decon** — short for *deconstruction*. This tool deconstructs compiled binaries back into readable, buildable source code.
 

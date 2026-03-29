@@ -1,4 +1,4 @@
-# Decon Agent — Binary Decompilation via Ralph Loop
+# Decon Loop — Binary Decompilation via Ralph Loop
 
 ## Mission
 

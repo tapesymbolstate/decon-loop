@@ -1,5 +1,5 @@
 #!/bin/bash
-# Ghidra headless analysis wrapper for decon-agent
+# Ghidra headless analysis wrapper for decon-loop
 #
 # Usage: ./ghidra_analyze.sh <binary_path> [full|quick|combined]
 #
